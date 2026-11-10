@@ -15,6 +15,7 @@
 #include "guest_allocator.h"
 #include "heap.h"
 #include "kernel_context.h"
+#include "event_pulse.h"
 #include "actctx.h"
 #include "child_process.h"
 #include "paths.h"
@@ -281,7 +282,7 @@ bool unsupported_library(NativeProcess &process, NativeEnvironment &environment,
 		process.return_api(0xC00000BBU);
 		return true;
 	}
-	const bool known = name == "PlaySoundW" || name == "ShellAboutW" || name == "InitCommonControlsEx";
+	const bool known = name == "ShellAboutW" || name == "InitCommonControlsEx";
 	if (!known)
 		return false;
 	process.api_arguments(0);
@@ -503,7 +504,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		static constexpr Rule rules[] = {{"user32.dll", "raven-user32.dll", "raven-user32."}, {"comdlg32.dll", "raven-shell.dll", "raven-shell."},
 			{"ole32.dll", "raven-shell.dll", "raven-shell."}, {"shell32.dll", "raven-shell.dll", "raven-shell."}, {"msvcrt.dll", "ucrtbase.dll", "ucrtbase."}, {"shlwapi.dll", "raven-shell.dll", "raven-shell."}, {"setupapi.dll", "raven-setupapi.dll", "raven-setupapi."},
 			{"ole32.dll", "raven-storage.dll", "raven-storage."}, {"combase.dll", "raven-shell.dll", "raven-shell."}, {"runtimeobject.dll", "raven-shell.dll", "raven-shell."},
-			{"api-ms-win-core-winrt-l1-1-0.dll", "raven-shell.dll", "raven-shell."}};
+			{"api-ms-win-core-winrt-l1-1-0.dll", "raven-shell.dll", "raven-shell."}, {"winmm.dll", "raven-winmm.dll", "raven-winmm."},
+			{"msacm32.dll", "raven-msacm32.dll", "raven-msacm32."}};
 		for (const auto &rule : rules) {
 			if (library != rule.library)
 				continue;
@@ -601,6 +603,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		const std::function<uint32_t(std::string_view)> &count, std::span<const std::pair<std::string_view, uint16_t>> ordinals = {}) {
 		std::string provider_key = dll;
 		if (modules.all().contains(dll)) {
+			if (std::string_view(dll) == "dsound.dll" && !modules.all().at(dll)->runtime_api)
+				return;
 			if (!program_may_replace(dll) || modules.all().at(dll)->runtime_api)
 				return;
 			provider_key = std::string("system32-") + dll;
@@ -948,6 +952,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		return true;
 	};
 	const auto remaining = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()); };
+	auto last_service = std::chrono::steady_clock::now();
 	// Runs one guest call, answering every API trap until the call returns or stops for another reason.
 	const auto invoke = [&](uint64_t address, std::span<const uint64_t> arguments) {
 		auto budget = remaining();
@@ -1051,6 +1056,12 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 				line << '\n';
 				// One write per line, so the traces of a program and of the programs it starts stay readable side by side.
 				std::cerr << line.str() << std::flush;
+			}
+			// A thread that never waits still gets the scheduler's services (multimedia timers, other processes' requests), as in a 64-bit
+			// process.
+			if (const auto now = std::chrono::steady_clock::now(); now - last_service >= std::chrono::milliseconds(2)) {
+				last_service = now;
+				guest_threads.serve();
 			}
 			if (api == "VerSetConditionMask" || api == "VerifyVersionInfoW") {
 				// The 64-bit condition mask is two words on the stack of a 32-bit program, and the handler takes it whole.
@@ -1301,7 +1312,9 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_shlwapi_api(shared_api, kernel);
 	register_platform_api(shared_api, kernel);
 	register_actctx_api(shared_api, kernel);
+	register_wave_api(shared_api, kernel);
 	register_mmio_api(shared_api, kernel);
+	register_winmm_api(shared_api, kernel, register_pulse_event(shared_api, kernel));
 	register_process_api(shared_api, kernel);
 	register_thread_api(shared_api, kernel);
 	register_sync_api(shared_api, kernel);
@@ -1319,6 +1332,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_process_info_api(shared_api, kernel);
 	register_font_service(shared_api, kernel);
 	register_shader_service(shared_api, kernel);
+	register_audio_service(shared_api, kernel);
 	// A 32-bit program runs under WOW64 on the 64-bit system Raven presents, its System32 being SysWOW64 until it switches redirection
 	// off. The value it keeps for the switch back is 1 when redirection was on.
 	shared_api.add("Wow64DisableWow64FsRedirection", 1, [&paths](ApiCall &call) {
@@ -1336,12 +1350,6 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		paths.redirect((call.u32(0) & 0xff) != 0);
 		call.ret(1);
 	});
-	// Waveform audio for 32-bit programs has no device yet: they hear that none exists, as on a machine without sound, and go on silent.
-	shared_api.add("waveOutGetNumDevs", 0, [](ApiCall &call) { call.ret(0); });
-	shared_api.add("waveInGetNumDevs", 0, [](ApiCall &call) { call.ret(0); });
-	for (const auto *name : {"waveOutGetDevCapsW", "waveOutGetDevCapsA", "waveInGetDevCapsW", "waveInGetDevCapsA"})
-		shared_api.add(name, 3, [](ApiCall &call) { call.ret(2); });
-	register_midi_api(shared_api);
 	register_profile_api(shared_api, profile);
 	register_ansi_adapters(shared_api);
 	register_legacy_file_api(shared_api);

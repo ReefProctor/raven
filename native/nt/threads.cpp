@@ -45,7 +45,9 @@ NativeThreads::NativeThreads(NativeProcess &process, NativeEnvironment &environm
 	long slice = 5;
 	if (const char *text = std::getenv("RAVEN_SLICE_MS"))
 		slice = std::strtol(text, nullptr, 10);
-	process.set_time_slicing(std::chrono::milliseconds(slice < 0 ? 0 : slice), [this] { return !tearing_down && live() > 1; }, [this] { yield(); });
+	process.set_time_slicing(std::chrono::milliseconds(slice < 0 ? 0 : slice), [this] {
+		return !tearing_down && (live() > 1 || std::any_of(dues.begin(), dues.end(), [](const auto &due) { return due(); }));
+	}, [this] { yield(); });
 	wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (wake < 0)
 		throw std::runtime_error("cannot create the scheduler's wake descriptor");
@@ -112,6 +114,11 @@ std::shared_ptr<GuestThread> NativeThreads::create(uint64_t start, uint64_t para
 {
 	if (process.parallel())
 		reap();
+	// A finished thread whose resources are released and that no handle names is forgotten: programs that start a thread for every
+	// timer tick would otherwise grow the list every scheduling decision walks.
+	std::erase_if(threads, [this](const auto &thread) {
+		return thread->state == GuestThread::State::done && !thread->main && !thread->host_stack && thread.get() != running && thread.use_count() == 1;
+	});
 	if (live() >= 256)
 		throw std::runtime_error("native guest thread limit reached");
 	auto thread = std::make_shared<GuestThread>();
@@ -472,6 +479,21 @@ void NativeThreads::nudge()
 {
 	const uint64_t one = 1;
 	[[maybe_unused]] const auto written = ::write(wake, &one, sizeof one);
+}
+
+std::function<void()> NativeThreads::remote_nudge() const
+{
+	const int copy = ::fcntl(wake, F_DUPFD_CLOEXEC, 0);
+	if (copy < 0)
+		return [] {};
+	const auto descriptor = std::shared_ptr<int>(new int(copy), [](int *held) {
+		::close(*held);
+		delete held;
+	});
+	return [descriptor] {
+		const uint64_t one = 1;
+		[[maybe_unused]] const auto written = ::write(*descriptor, &one, sizeof one);
+	};
 }
 
 bool NativeThreads::block(std::function<bool()> ready, std::optional<std::chrono::steady_clock::time_point> wake)
