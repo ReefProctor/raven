@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  *
  * PlaySound and sndPlaySound: one sound at a time, played through a wave output of this component. The sound is found and its RIFF
- * header read before the call returns, so a sound that cannot be played fails even when it was asked to play asynchronously; only the
+ * header read before the call returns, so an invalid file or memory sound fails even when it was asked to play asynchronously; only the
  * playing happens on a thread of its own. Compressed sounds would need the ACM and are refused.
  */
 #include "winmm_private.h"
@@ -302,6 +302,11 @@ static BOOL play_sound(const WCHAR *name, HMODULE module, DWORD flags)
 	const BYTE *data = find_sound(name, module, flags, &owned, &size);
 	if (!data && !(flags & SND_NODEFAULT) && !(flags & SND_MEMORY))
 		data = owned = find_alias(L".Default", &size);
+	/* Preserve the runtime's silent system sounds when no scheme resolves the alias, unless the caller asks for failure. */
+	if (!data && (flags & SND_ALIAS) && !(flags & SND_NODEFAULT)) {
+		LeaveCriticalSection(&play_lock);
+		return TRUE;
+	}
 	WAVEFORMATEXTENSIBLE format;
 	const BYTE *samples;
 	DWORD length;

@@ -205,6 +205,16 @@ static int devices(void)
 	HMIDIOUT out = (HMIDIOUT)1;
 	if (midiOutOpen(&out, 0, 0, 0, CALLBACK_NULL) != MMSYSERR_BADDEVICEID || out) return 34;
 	if (mmsystemGetVersion() != 0x030a) return 35;
+	out = (HMIDIOUT)1;
+	if (midiOutOpen(&out, MIDI_MAPPER, 0, 0, CALLBACK_NULL) != MIDIERR_NODEVICE || out) return 36;
+	HMIDIIN in = (HMIDIIN)1;
+	if (midiInOpen(&in, 0, 0, 0, CALLBACK_NULL) != MMSYSERR_BADDEVICEID || in) return 37;
+	in = (HMIDIIN)1;
+	if (midiInOpen(&in, MIDI_MAPPER, 0, 0, CALLBACK_NULL) != MIDIERR_NODEVICE || in) return 38;
+	if (!PlaySoundW(L"raven-unconfigured-sound", NULL, SND_ALIAS | SND_ASYNC) ||
+		!PlaySoundA("raven-unconfigured-sound", NULL, SND_ALIAS | SND_ASYNC)) return 65;
+	if (PlaySoundW(L"raven-unconfigured-sound", NULL, SND_ALIAS | SND_ASYNC | SND_NODEFAULT) ||
+		PlaySoundA("raven-unconfigured-sound", NULL, SND_ALIAS | SND_ASYNC | SND_NODEFAULT)) return 66;
 	return 0;
 }
 

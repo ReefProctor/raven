@@ -21,7 +21,6 @@ constexpr uint32_t time_periodic = 0x1, time_callback_event_set = 0x10, time_cal
 	time_kill_synchronous = 0x100;
 // The range timeGetDevCaps reports.
 constexpr uint32_t shortest_delay = 1, longest_delay = 1000000;
-constexpr uint32_t snd_purge = 0x40;
 
 struct MultimediaTimer {
 	uint32_t delay = 0, flags = 0;
@@ -192,24 +191,10 @@ void register_winmm_api(ApiRegistry &registry, KernelContext &context, std::shar
 		call.ret(0);
 	});
 
-	// There is no sound behind PlaySound yet: stopping always succeeds, and a sound to play reports that it could not be played.
-	const auto play = [](ApiCall &call, uint32_t flags) { call.ret(!call[0] || (flags & snd_purge) ? 1 : 0); };
-	for (const auto *name : {"PlaySound", "PlaySoundA", "PlaySoundW"})
-		registry.add(name, 3, [play](ApiCall &call) { play(call, call.u32(2)); });
-	for (const auto *name : {"sndPlaySoundA", "sndPlaySoundW"})
-		registry.add(name, 2, [play](ApiCall &call) { play(call, 0); });
-
-	// MIDI and auxiliary audio: the machine has no such devices.
-	for (const auto *name : {"midiOutGetNumDevs", "midiInGetNumDevs", "auxGetNumDevs"})
-		registry.add(name, 0, [](ApiCall &call) { call.ret(0); });
-	for (const auto *name : {"midiOutGetDevCapsA", "midiOutGetDevCapsW", "midiInGetDevCapsA", "midiInGetDevCapsW", "auxGetDevCapsA", "auxGetDevCapsW"})
+	// No auxiliary audio device; wave_api registers MIDI and the host PlaySound fallback.
+	registry.add("auxGetNumDevs", 0, [](ApiCall &call) { call.ret(0); });
+	for (const auto *name : {"auxGetDevCapsA", "auxGetDevCapsW"})
 		registry.add(name, 3, [](ApiCall &call) { call.ret(mmsyserr_baddeviceid); });
-	for (const auto *name : {"midiOutOpen", "midiInOpen"})
-		registry.add(name, 5, [](ApiCall &call) {
-			if (call[0])
-				call.store_pointer(call[0], 0);
-			call.ret(mmsyserr_baddeviceid);
-		});
 	// Windows 95 onwards answer version 3.10.
 	registry.add("mmsystemGetVersion", 0, [](ApiCall &call) { call.ret(0x030a); });
 }
