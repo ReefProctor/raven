@@ -75,7 +75,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     target_compile_options(raven-bootstrap PRIVATE -fno-sanitize=all)
     target_link_options(raven-bootstrap PRIVATE -fno-sanitize=all -nostdlib -static
         -Wl,-no-pie,-Ttext-segment=0x700000000000,-e,_start,--build-id=none)
-    add_library(raven_cpu STATIC cpu/native_cpu.cpp nt/normalization.cpp nt/environment.cpp nt/system.cpp nt/firmware.cpp nt/interfaces.cpp nt/providers.cpp nt/api.cpp nt/unwind.cpp nt/seh.cpp nt/apiset.cpp nt/system_exports.cpp nt/text.cpp nt/paths.cpp nt/file_api.cpp nt/ansi_api.cpp nt/shlwapi_api.cpp nt/registry_api.cpp nt/shell_api.cpp nt/platform_api.cpp nt/hash.cpp nt/version_api.cpp nt/system_api.cpp nt/process_api.cpp nt/actctx.cpp nt/security_api.cpp nt/access_token.cpp nt/event.cpp nt/mutex.cpp nt/child_api.cpp nt/child_process.cpp nt/winsock_api.cpp nt/host_api.cpp nt/pipe.cpp nt/job_api.cpp nt/wave_api.cpp nt/mmio_api.cpp nt/inherit.cpp nt/handle_channel.cpp nt/elevation.cpp nt/snapshot.cpp nt/apps.cpp nt/sandbox.cpp nt/sandbox_api.cpp nt/confine.cpp nt/restart.cpp nt/service_api.cpp nt/crypt32_api.cpp nt/bcrypt_api.cpp nt/authenticode.cpp nt/process_info_api.cpp nt/font_service.cpp nt/shader_service.cpp nt/canvas_service.cpp nt/sync_api.cpp nt/threads.cpp nt/thread_api.cpp nt/text_api.cpp nt/console.cpp nt/console_api.cpp nt/memory_api.cpp nt/guest_allocator.cpp nt/module_api.cpp nt/loader.cpp nt/tls.cpp nt/exceptions.cpp nt/resources.cpp nt/memory.cpp nt/objects.cpp nt/object_api.cpp nt/heap.cpp desktop/objects.cpp desktop/nonclient.cpp desktop/api.cpp desktop/surface.cpp desktop/windows.cpp desktop/system.cpp desktop/user_api.cpp desktop/window_manager.cpp desktop/window_ansi.cpp desktop/menu_manager.cpp desktop/shared_pixels.cpp desktop/foreign_surface.cpp desktop/user_ext.cpp desktop/scrollbar.cpp desktop/window_long.cpp desktop/child_frame.cpp desktop/gdi.cpp desktop/gdi_api.cpp desktop/gdi_text.cpp desktop/theme.cpp)
+    add_library(raven_cpu STATIC cpu/native_cpu.cpp nt/normalization.cpp nt/environment.cpp nt/system.cpp nt/firmware.cpp nt/interfaces.cpp nt/providers.cpp nt/audio_engine.cpp nt/audio_service.cpp nt/winmm_api.cpp nt/event_pulse.cpp nt/api.cpp nt/unwind.cpp nt/seh.cpp nt/apiset.cpp nt/system_exports.cpp nt/text.cpp nt/paths.cpp nt/file_api.cpp nt/ansi_api.cpp nt/shlwapi_api.cpp nt/registry_api.cpp nt/shell_api.cpp nt/platform_api.cpp nt/hash.cpp nt/version_api.cpp nt/system_api.cpp nt/process_api.cpp nt/actctx.cpp nt/security_api.cpp nt/access_token.cpp nt/event.cpp nt/mutex.cpp nt/child_api.cpp nt/child_process.cpp nt/winsock_api.cpp nt/host_api.cpp nt/pipe.cpp nt/job_api.cpp nt/wave_api.cpp nt/mmio_api.cpp nt/inherit.cpp nt/handle_channel.cpp nt/elevation.cpp nt/snapshot.cpp nt/apps.cpp nt/sandbox.cpp nt/sandbox_api.cpp nt/confine.cpp nt/restart.cpp nt/service_api.cpp nt/crypt32_api.cpp nt/bcrypt_api.cpp nt/authenticode.cpp nt/process_info_api.cpp nt/font_service.cpp nt/shader_service.cpp nt/canvas_service.cpp nt/sync_api.cpp nt/threads.cpp nt/thread_api.cpp nt/text_api.cpp nt/console.cpp nt/console_api.cpp nt/memory_api.cpp nt/guest_allocator.cpp nt/module_api.cpp nt/loader.cpp nt/tls.cpp nt/exceptions.cpp nt/resources.cpp nt/memory.cpp nt/objects.cpp nt/object_api.cpp nt/heap.cpp desktop/objects.cpp desktop/nonclient.cpp desktop/api.cpp desktop/surface.cpp desktop/windows.cpp desktop/system.cpp desktop/user_api.cpp desktop/window_manager.cpp desktop/window_ansi.cpp desktop/menu_manager.cpp desktop/shared_pixels.cpp desktop/foreign_surface.cpp desktop/user_ext.cpp desktop/scrollbar.cpp desktop/window_long.cpp desktop/child_frame.cpp desktop/gdi.cpp desktop/gdi_api.cpp desktop/gdi_text.cpp desktop/theme.cpp)
     target_include_directories(raven_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     set(NLS_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/upstream/windows-codepages)
     file(SHA256 ${NLS_SOURCE}/c_1252.txt NLS_TEXT_HASH)
@@ -4172,6 +4172,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
                     add_test(NAME native_associate_x${width} COMMAND raven --run-process --execution=native ${sandbox_client} -- associate)
                     set_tests_properties(native_associate_x${width} PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "Native entry returned 0 "
                         ENVIRONMENT RAVEN_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/associate-prefix${width})
+                    set(winmm_client ${CMAKE_CURRENT_BINARY_DIR}/winmm-client${width}.exe)
+                    add_custom_command(OUTPUT ${winmm_client}
+                        COMMAND ${accprop_compiler} -nostdlib -O1 -fno-builtin -fno-stack-protector -Wl,--entry,${accprop_entry},--no-insert-timestamp
+                            -o ${winmm_client} ${LOADER_SOURCES}/winmm_client.c -lwinmm -lkernel32
+                        DEPENDS ${LOADER_SOURCES}/winmm_client.c VERBATIM)
+                    add_custom_target(winmm_fixture${width} ALL DEPENDS ${winmm_client})
+                    add_test(NAME native_winmm_x${width} COMMAND raven --run-process --execution=native ${winmm_client})
+                    set_tests_properties(native_winmm_x${width} PROPERTIES TIMEOUT 30 PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                    set(audio_client ${CMAKE_CURRENT_BINARY_DIR}/audio-client${width}.exe)
+                    add_custom_command(OUTPUT ${audio_client}
+                        COMMAND ${accprop_compiler} -nostdlib -O1 -fno-builtin -fno-stack-protector -Wl,--entry,${accprop_entry},--no-insert-timestamp
+                            -o ${audio_client} ${LOADER_SOURCES}/audio_client.c -lwinmm -lkernel32
+                        DEPENDS ${LOADER_SOURCES}/audio_client.c ${PROJECT_SOURCE_DIR}/native/nt/raven_audio.h VERBATIM)
+                    add_custom_target(audio_fixture${width} ALL DEPENDS ${audio_client})
+                    add_test(NAME native_audio_x${width} COMMAND raven --run-process --execution=native ${audio_client})
+                    # The device that plays to nowhere keeps the format's pace on any machine, with or without a sound server.
+                    set_tests_properties(native_audio_x${width} PROPERTIES TIMEOUT 30 PASS_REGULAR_EXPRESSION "Native entry returned 0 "
+                        ENVIRONMENT "RAVEN_AUDIO=null")
                     if(width EQUAL 64)
                         set(timer_queue_client ${CMAKE_CURRENT_BINARY_DIR}/timer-queue-client${width}.exe)
                         add_custom_command(OUTPUT ${timer_queue_client}
@@ -4524,22 +4542,28 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
                 set(media_source ${PROJECT_SOURCE_DIR}/native/guest/raven-media)
                 set(media_components ${CMAKE_CURRENT_BINARY_DIR}/avrt.dll ${CMAKE_CURRENT_BINARY_DIR}/mfplat.dll
                     ${CMAKE_CURRENT_BINARY_DIR}/x86/avrt.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/mfplat.dll
-                    ${CMAKE_CURRENT_BINARY_DIR}/mmdevapi.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/mmdevapi.dll)
+                    ${CMAKE_CURRENT_BINARY_DIR}/mmdevapi.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/mmdevapi.dll
+                    ${CMAKE_CURRENT_BINARY_DIR}/raven-msacm32.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/raven-msacm32.dll)
                 add_custom_command(OUTPUT ${media_components}
                     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/x86
                     COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/avrt.dll
                         ${media_source}/avrt.c -lkernel32
                     COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/mfplat.dll
-                        ${media_source}/mfplat.c -lkernel32
+                        ${media_source}/mfplat.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lole32 -luuid -lkernel32
                     COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/x86/avrt.dll
                         ${media_source}/avrt.c -lkernel32
                     COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/x86/mfplat.dll
-                        ${media_source}/mfplat.c -lkernel32
+                        ${media_source}/mfplat.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lole32 -luuid -lkernel32
                     COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/mmdevapi.dll
                         ${media_source}/mmdevapi.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lole32 -lwinmm -luuid -lkernel32 -lgcc
                     COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/x86/mmdevapi.dll
                         ${media_source}/mmdevapi.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lole32 -lwinmm -luuid -lkernel32 -lgcc
-                    DEPENDS ${media_source}/avrt.c ${media_source}/mfplat.c ${media_source}/mmdevapi.c VERBATIM)
+                    COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/raven-msacm32.dll
+                        ${media_source}/msacm32.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lkernel32
+                    COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/x86/raven-msacm32.dll
+                        ${media_source}/msacm32.c ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c -lkernel32
+                    DEPENDS ${media_source}/avrt.c ${media_source}/mfplat.c ${media_source}/mmdevapi.c ${media_source}/msacm32.c
+                        ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c VERBATIM)
                 add_custom_target(media_component ALL DEPENDS ${media_components})
                 # A media library imports both, as cri_ware_unity.dll does; the fixture does too, and asks each one for its answers.
                 foreach(width 64 32)
@@ -4552,9 +4576,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
                         set(media_entry _raven_entry)
                     endif()
                     add_custom_command(OUTPUT ${media_client}
-                        COMMAND ${media_compiler} -O2 -nostdlib -fno-stack-protector -fno-builtin
+                        COMMAND ${media_compiler} -O2 -nostdlib -fno-stack-protector -fno-builtin -mno-stack-arg-probe
                             -Wl,--entry,${media_entry},--no-insert-timestamp
-                            -o ${media_client} ${LOADER_SOURCES}/media_client.c -lavrt -lmfplat -lkernel32
+                            -o ${media_client} ${LOADER_SOURCES}/media_client.c -lavrt -lmfplat -lmsacm32 -lole32 -luuid -lkernel32
                         DEPENDS ${LOADER_SOURCES}/media_client.c VERBATIM)
                     add_custom_target(media_fixture${width} ALL DEPENDS ${media_client} media_component)
                     add_test(NAME native_media_x${width} COMMAND raven --run-process --execution=native ${media_client})
@@ -4600,6 +4624,112 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
                     add_custom_target(winscard_fixture${width} ALL DEPENDS ${winscard_client} winscard_component)
                     add_test(NAME native_winscard_x${width} COMMAND raven --run-process --execution=native ${winscard_client})
                     set_tests_properties(native_winscard_x${width} PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                endforeach()
+                # The import libraries of ravenhost.dll's sound calls, which the guest audio components link against.
+                set(winmm_source ${PROJECT_SOURCE_DIR}/native/guest/raven-winmm)
+                add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio64.a ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio32.a
+                    COMMAND ${RAVEN_DLLTOOL} -d ${winmm_source}/ravenhost64.def -l ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio64.a
+                    COMMAND ${RAVEN_DLLTOOL32} -k -d ${winmm_source}/ravenhost32.def -l ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio32.a
+                    DEPENDS ${winmm_source}/ravenhost64.def ${winmm_source}/ravenhost32.def VERBATIM)
+                add_custom_target(audio_imports ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio64.a ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio32.a)
+                # raven-winmm.dll for each width: the timers, wave devices, mixer and PlaySound that winmm.dll forwards, on guest threads
+                # over the same streams.
+                set(winmm_files ${winmm_source}/main.c ${winmm_source}/timer.c ${winmm_source}/wave.c ${winmm_source}/mixer.c
+                    ${winmm_source}/sound.c)
+                add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/raven-winmm.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/raven-winmm.dll
+                    COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/raven-winmm.dll
+                        ${winmm_files} ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c
+                        ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio64.a -lkernel32 -lgcc
+                    COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/x86/raven-winmm.dll
+                        ${winmm_files} ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c
+                        ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio32.a -lkernel32 -lgcc
+                    DEPENDS ${winmm_files} ${winmm_source}/winmm_private.h ${PROJECT_SOURCE_DIR}/native/nt/raven_audio.h audio_imports
+                    VERBATIM)
+                add_custom_target(winmm_component ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/raven-winmm.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/raven-winmm.dll)
+                # dsound.dll for each width: DirectSound's devices, buffers and capture, mixed by a guest thread into one stream of the engine.
+                set(dsound_source ${PROJECT_SOURCE_DIR}/native/guest/raven-dsound)
+                set(dsound_files ${dsound_source}/device.c ${dsound_source}/buffer.c ${dsound_source}/mixer.c ${dsound_source}/capture.c)
+                add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dsound.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/dsound.dll
+                    COMMAND ${RAVEN_MINGW64} ${accprop_flags} -Wl,--entry,DllMain,--no-insert-timestamp -o ${CMAKE_CURRENT_BINARY_DIR}/dsound.dll
+                        ${dsound_source}/dsound.def ${dsound_files} ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c
+                        ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio64.a -luuid -lkernel32 -lgcc
+                    COMMAND ${RAVEN_MINGW32} ${accprop_flags} -Wl,--entry,_DllMain@12,--kill-at,--enable-stdcall-fixup,--no-insert-timestamp
+                        -o ${CMAKE_CURRENT_BINARY_DIR}/x86/dsound.dll
+                        ${dsound_source}/dsound.def ${dsound_files} ${PROJECT_SOURCE_DIR}/native/guest/raven-dwrite/crt.c
+                        ${CMAKE_CURRENT_BINARY_DIR}/libravenhost-audio32.a -luuid -lkernel32 -lgcc
+                    DEPENDS ${dsound_files} ${dsound_source}/dsound_private.h ${dsound_source}/dsound.def
+                        ${PROJECT_SOURCE_DIR}/native/nt/raven_audio.h audio_imports
+                    VERBATIM)
+                add_custom_target(dsound_component ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/dsound.dll ${CMAKE_CURRENT_BINARY_DIR}/x86/dsound.dll)
+                # The fixture plays and records on the null device, so the pace of its buffers is the engine's alone.
+                foreach(width 64 32)
+                    if(width EQUAL 64)
+                        set(audio_compiler ${RAVEN_MINGW64})
+                        set(audio_entry raven_entry)
+                    else()
+                        set(audio_compiler ${RAVEN_MINGW32})
+                        set(audio_entry _raven_entry)
+                    endif()
+                    set(wave_client ${CMAKE_CURRENT_BINARY_DIR}/wave-client${width}.exe)
+                    add_custom_command(OUTPUT ${wave_client}
+                        COMMAND ${audio_compiler} -O1 -nostdlib -fno-stack-protector -fno-builtin
+                            -Wl,--entry,${audio_entry},--no-insert-timestamp
+                            -o ${wave_client} ${LOADER_SOURCES}/wave_client.c -lwinmm -luser32 -lkernel32 -lgcc
+                        DEPENDS ${LOADER_SOURCES}/wave_client.c VERBATIM)
+                    add_custom_target(wave_fixture${width} ALL DEPENDS ${wave_client} winmm_component)
+                    set(dsound_client ${CMAKE_CURRENT_BINARY_DIR}/dsound-client${width}.exe)
+                    add_custom_command(OUTPUT ${dsound_client}
+                        COMMAND ${audio_compiler} -O1 -nostdlib -fno-stack-protector -fno-builtin
+                            -Wl,--entry,${audio_entry},--no-insert-timestamp
+                            -o ${dsound_client} ${LOADER_SOURCES}/dsound_client.c -ldsound -lole32 -luser32 -lkernel32 -lgcc
+                        DEPENDS ${LOADER_SOURCES}/dsound_client.c VERBATIM)
+                    add_custom_target(dsound_fixture${width} ALL DEPENDS ${dsound_client} dsound_component)
+                    set(dsound_load_dir ${CMAKE_CURRENT_BINARY_DIR}/dsound-load-x${width})
+                    set(dsound_local_dir ${CMAKE_CURRENT_BINARY_DIR}/dsound-local-x${width})
+                    set(dsound_load_client ${dsound_load_dir}/dsound-load-client.exe)
+                    set(dsound_local_client ${dsound_local_dir}/dsound-local-client.exe)
+                    set(dsound_local_stub ${dsound_local_dir}/dsound.dll)
+                    if(width EQUAL 32)
+                        set(dsound_stub_flags -Wl,--kill-at)
+                        set(dsound_stub_entry _DllMain@12)
+                    else()
+                        set(dsound_stub_flags)
+                        set(dsound_stub_entry DllMain)
+                    endif()
+                    add_custom_command(OUTPUT ${dsound_load_client} ${dsound_local_client} ${dsound_local_stub}
+                        COMMAND ${CMAKE_COMMAND} -E make_directory ${dsound_load_dir} ${dsound_local_dir}
+                        COMMAND ${audio_compiler} -O1 -nostdlib -fno-stack-protector -fno-builtin
+                            -Wl,--entry,${audio_entry},--no-insert-timestamp
+                            -o ${dsound_load_client} ${LOADER_SOURCES}/dsound_load_client.c -lkernel32 -lgcc
+                        COMMAND ${audio_compiler} -O1 -nostdlib -fno-stack-protector -fno-builtin -DEXPECT_LOCAL_DSOUND
+                            -Wl,--entry,${audio_entry},--no-insert-timestamp
+                            -o ${dsound_local_client} ${LOADER_SOURCES}/dsound_load_client.c -lkernel32 -lgcc
+                        COMMAND ${audio_compiler} -O1 -nostdlib -fno-stack-protector -fno-builtin -shared
+                            -Wl,--entry,${dsound_stub_entry},--no-insert-timestamp ${dsound_stub_flags}
+                            -o ${dsound_local_stub} ${LOADER_SOURCES}/dsound_local_stub.c -lkernel32 -lgcc
+                        DEPENDS ${LOADER_SOURCES}/dsound_load_client.c ${LOADER_SOURCES}/dsound_local_stub.c VERBATIM)
+                    add_custom_target(dsound_load_fixture${width} ALL
+                        DEPENDS ${dsound_load_client} ${dsound_local_client} ${dsound_local_stub})
+                    add_test(NAME native_wave_x${width} COMMAND raven --run-process --execution=native ${wave_client})
+                    set_tests_properties(native_wave_x${width} PROPERTIES TIMEOUT 30 ENVIRONMENT RAVEN_AUDIO=null
+                        PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                    add_test(NAME native_dsound_load_x${width} COMMAND raven --run-process --execution=native ${dsound_load_client})
+                    set_tests_properties(native_dsound_load_x${width} PROPERTIES TIMEOUT 30
+                        PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                    add_test(NAME native_dsound_local_x${width} COMMAND raven --run-process --execution=native ${dsound_local_client})
+                    set_tests_properties(native_dsound_local_x${width} PROPERTIES TIMEOUT 30
+                        PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                    # COM finds the class, and PROPVARIANTs are cleared, by raven-shell.dll, which comes with the controls.
+                    if(width EQUAL 64)
+                        set(dsound_shell "${RAVEN_CONTROLS_COMPONENT_DIR}")
+                    else()
+                        set(dsound_shell "${RAVEN_CONTROLS32_COMPONENT_DIR}")
+                    endif()
+                    if(dsound_shell)
+                        add_test(NAME native_dsound_x${width} COMMAND raven --run-process --execution=native ${dsound_client})
+                        set_tests_properties(native_dsound_x${width} PROPERTIES TIMEOUT 30 ENVIRONMENT RAVEN_AUDIO=null
+                            PASS_REGULAR_EXPRESSION "Native entry returned 0 ")
+                    endif()
                 endforeach()
                 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/x86-ucrt-client.exe
                     COMMAND ${RAVEN_MINGW32} -O2 -nostdlib -fno-stack-protector -fno-builtin

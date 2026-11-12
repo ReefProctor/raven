@@ -123,6 +123,8 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context);
 // MIDI as on a machine with no MIDI ports, for programs of either width.
 void register_midi_api(ApiRegistry &registry);
 void register_mmio_api(ApiRegistry &registry, KernelContext &context);
+// winmm on a machine without an auxiliary audio device.
+void register_winmm_api(ApiRegistry &registry);
 void register_process_info_api(ApiRegistry &registry, KernelContext &context);
 void register_crypt32_api(ApiRegistry &registry, KernelContext &context);
 void register_bcrypt_api(ApiRegistry &registry, KernelContext &context);
@@ -130,6 +132,8 @@ void register_font_service(ApiRegistry &registry, KernelContext &context);
 void register_sandbox_api(ApiRegistry &registry, KernelContext &context);
 // The HLSL compiler behind d3dcompiler_47.dll: requests from the guest component, results read back in parts.
 void register_shader_service(ApiRegistry &registry, KernelContext &context);
+// The sound engine for the guest's audio components: streams whose samples and counters live in a page the guest maps (raven_audio.h).
+void register_audio_service(ApiRegistry &registry, KernelContext &context);
 // An installed font family as GDI enumerates it: the face closest to regular, and the scripts and code pages its OS/2 table claims.
 struct InstalledFamily {
 	std::u16string name;

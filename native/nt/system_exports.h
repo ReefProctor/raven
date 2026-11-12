@@ -23,7 +23,7 @@ inline constexpr std::string_view core_system_libraries[]{"ntdll.dll", "kernel32
 // The system libraries that graphics wrappers (DXVK, ReShade) and mod loaders ship beside a program, whose copy there loads instead of the
 // runtime's own.
 inline constexpr std::string_view program_replaceable_libraries[]{"d3d8.dll", "d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll", "ddraw.dll",
-	"dinput.dll", "dinput8.dll", "winmm.dll", "version.dll", "xinput1_3.dll", "xinput1_4.dll"};
+	"dinput.dll", "dinput8.dll", "winmm.dll", "dsound.dll", "version.dll", "xinput1_3.dll", "xinput1_4.dll"};
 // Whether a copy of the library in the program's folder loads instead of the runtime's: one of program_replaceable_libraries, or, with
 // RAVEN_PREFER_LOCAL_DLLS=1, any other system library outside core_system_libraries.
 bool program_may_replace(std::string_view dll);
@@ -32,6 +32,6 @@ bool program_may_replace(std::string_view dll);
 inline constexpr std::string_view runtime_components[]{"msi.dll", "cabinet.dll", "sxs.dll", "rpcrt4.dll", "msxml3.dll", "libxslt.dll", "atl100.dll",
 	"libjpeg.dll", "libtiff.dll", "propsys.dll", "mlang.dll", "windowscodecs.dll", "gdiplus.dll", "urlmon.dll", "riched20.dll", "msftedit.dll", "msvfw32.dll", "advpack.dll", "mspatcha.dll", "vbscript.dll", "scrrun.dll", "wshom.ocx", "jscript.dll",
 	"mscoree.dll", "taskschd.dll", "webservices.dll", "hlink.dll", "icu.dll", "icuuc.dll", "icuin.dll", "raven-accprop.dll", "raven-deployment.dll", "raven-netlist.dll", "raven-bits.dll", "raven-uisettings.dll", "raven-twinapi.dll", "xmllite.dll", "d3dcompiler_47.dll",
-	"winsqlite3.dll", "avrt.dll", "mfplat.dll", "mmdevapi.dll", "winscard.dll", "raven-web.dll", "raven-appx.dll", "raven-wmi.dll", "raven-ieframe.dll", "raven-webengine.dll"};
+	"winsqlite3.dll", "avrt.dll", "mfplat.dll", "raven-msacm32.dll", "mmdevapi.dll", "winscard.dll", "raven-web.dll", "raven-appx.dll", "raven-wmi.dll", "raven-ieframe.dll", "raven-webengine.dll"};
 
 }

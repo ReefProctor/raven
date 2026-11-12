@@ -15,6 +15,7 @@
 #include "guest_allocator.h"
 #include "heap.h"
 #include "kernel_context.h"
+#include "event_pulse.h"
 #include "actctx.h"
 #include "child_process.h"
 #include "paths.h"
@@ -503,7 +504,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		static constexpr Rule rules[] = {{"user32.dll", "raven-user32.dll", "raven-user32."}, {"comdlg32.dll", "raven-shell.dll", "raven-shell."},
 			{"ole32.dll", "raven-shell.dll", "raven-shell."}, {"shell32.dll", "raven-shell.dll", "raven-shell."}, {"msvcrt.dll", "ucrtbase.dll", "ucrtbase."}, {"shlwapi.dll", "raven-shell.dll", "raven-shell."}, {"setupapi.dll", "raven-setupapi.dll", "raven-setupapi."},
 			{"ole32.dll", "raven-storage.dll", "raven-storage."}, {"combase.dll", "raven-shell.dll", "raven-shell."}, {"runtimeobject.dll", "raven-shell.dll", "raven-shell."},
-			{"api-ms-win-core-winrt-l1-1-0.dll", "raven-shell.dll", "raven-shell."}};
+			{"api-ms-win-core-winrt-l1-1-0.dll", "raven-shell.dll", "raven-shell."}, {"winmm.dll", "raven-winmm.dll", "raven-winmm."},
+			{"msacm32.dll", "raven-msacm32.dll", "raven-msacm32."}};
 		for (const auto &rule : rules) {
 			if (library != rule.library)
 				continue;
@@ -601,6 +603,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		const std::function<uint32_t(std::string_view)> &count, std::span<const std::pair<std::string_view, uint16_t>> ordinals = {}) {
 		std::string provider_key = dll;
 		if (modules.all().contains(dll)) {
+			if (std::string_view(dll) == "dsound.dll" && !modules.all().at(dll)->runtime_api)
+				return;
 			if (!program_may_replace(dll) || modules.all().at(dll)->runtime_api)
 				return;
 			provider_key = std::string("system32-") + dll;
@@ -1325,6 +1329,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_platform_api(shared_api, kernel);
 	register_actctx_api(shared_api, kernel);
 	register_mmio_api(shared_api, kernel);
+	register_pulse_event(shared_api, kernel);
+	register_winmm_api(shared_api);
 	register_process_api(shared_api, kernel);
 	register_thread_api(shared_api, kernel);
 	register_sync_api(shared_api, kernel);
@@ -1343,6 +1349,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_font_service(shared_api, kernel);
 	register_sandbox_api(shared_api, kernel);
 	register_shader_service(shared_api, kernel);
+	register_audio_service(shared_api, kernel);
 	// A 32-bit program runs under WOW64 on the 64-bit system Raven presents, its System32 being SysWOW64 until it switches redirection
 	// off. The value it keeps for the switch back is 1 when redirection was on.
 	shared_api.add("Wow64DisableWow64FsRedirection", 1, [&paths](ApiCall &call) {

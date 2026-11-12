@@ -15,6 +15,7 @@
 #include "apiset.h"
 #include "text.h"
 #include "kernel_context.h"
+#include "event_pulse.h"
 #include "actctx.h"
 #include "unwind.h"
 #include "prefix.h"
@@ -2217,7 +2218,7 @@ NativeResult run_native_process(ModuleSet &modules, PEModule &entry,
 		if (found != modules.all().end() && found->second->runtime_api) {
 			provider = found->second.get();
 		} else if (found != modules.all().end()) {
-			if (!program_may_replace(name))
+			if (!program_may_replace(name) || name == "dsound.dll")
 				continue;
 			const auto fallback = "system32-" + name;
 			if (!modules.all().contains(fallback)) {
@@ -2263,6 +2264,9 @@ NativeResult run_native_process(ModuleSet &modules, PEModule &entry,
 				{"ole32.dll", "raven-storage.dll", "raven-storage."}, {"combase.dll", "raven-shell.dll", "raven-shell."},
 				{"uiautomationcore.dll", "raven-shell.dll", "raven-shell."}, {"runtimeobject.dll", "raven-shell.dll", "raven-shell."},
 				{"api-ms-win-core-winrt-l1-1-0.dll", "raven-shell.dll", "raven-shell."},
+				// The multimedia timers, wave devices, mixer and PlaySound call the program back on guest threads; the clock stays here.
+				{"winmm.dll", "raven-winmm.dll", "raven-winmm."},
+				{"msacm32.dll", "raven-msacm32.dll", "raven-msacm32."},
 				// The heap, critical sections and the free paths of SRW locks and condition variables run in the guest RTL.
 				{"kernel32.dll", "raven-rtl.dll", "raven-rtl."}, {"kernelbase.dll", "raven-rtl.dll", "raven-rtl."},
 				// The generic AVL tables and critical sections of ntdll; its heap stays with the host, which calls the guest RTL itself.
@@ -3069,12 +3073,15 @@ NativeResult run_native_process(ModuleSet &modules, PEModule &entry,
 	register_job_api(api_registry, kernel);
 	register_wave_api(api_registry, kernel);
 	register_mmio_api(api_registry, kernel);
+	register_pulse_event(api_registry, kernel);
+	register_winmm_api(api_registry);
 	register_crypt32_api(api_registry, kernel);
 	register_bcrypt_api(api_registry, kernel);
 	register_process_info_api(api_registry, kernel);
 	register_font_service(api_registry, kernel);
 	register_sandbox_api(api_registry, kernel);
 	register_shader_service(api_registry, kernel);
+	register_audio_service(api_registry, kernel);
 	register_canvas_service(api_registry, kernel);
 	register_sync_api(api_registry, kernel);
 	register_thread_api(api_registry, kernel);
