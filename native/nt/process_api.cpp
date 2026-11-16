@@ -179,7 +179,6 @@ void register_process_api(ApiRegistry &registry, KernelContext &context)
 	// No kernel debugger answers a prompt: nothing is read.
 	registry.add("DbgPrompt", 3, [](ApiCall &call) { call.ret(0); });
 	registry.add("DisableThreadLibraryCalls", 1, [](ApiCall &call) { call.ret(1); });
-	registry.add("AreFileApisANSI", 0, [](ApiCall &call) { call.ret(1); });
 	registry.add("FreeLibraryWhenCallbackReturns", 2, [](ApiCall &call) { call.ret(0); });
 	registry.add("GetProcessVersion", 1, [](ApiCall &call) { call.ret(0x0006000a); });
 	registry.add("FreeResource", 1, [](ApiCall &call) { call.ret(0); });
@@ -248,7 +247,6 @@ void register_process_api(ApiRegistry &registry, KernelContext &context)
 	};
 	registry.add("EnumResourceNamesW", 4, [enumerate_names](ApiCall &call) { enumerate_names(call, true); });
 	registry.add("EnumResourceNamesA", 4, [enumerate_names](ApiCall &call) { enumerate_names(call, false); });
-	registry.add("ReadDirectoryChangesW", 8, [](ApiCall &call) { call.fail(50, 0); });
 	registry.add("FindFirstStreamW", 4, [](ApiCall &call) { call.fail(38, UINT64_MAX); });
 	const auto directory = [](ApiCall &call, bool wide, const std::string &path) {
 		const size_t capacity = call.u32(1);
@@ -636,7 +634,14 @@ void register_process_api(ApiRegistry &registry, KernelContext &context)
 		}
 		call.ret(1);
 	});
-	registry.add("SetStdHandle", 2, [](ApiCall &call) { call.ret(1); });
+	registry.add("SetStdHandle", 2, [](ApiCall &call) {
+		if (call.environment.set_standard_handle(uint32_t(call[0]), call[1])) {
+			call.ret(1);
+			return;
+		}
+		call.set_last_error(6);
+		call.ret(0);
+	});
 }
 
 }

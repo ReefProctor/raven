@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-RUNTIME = Path(f"/run/user/{os.getuid()}/raven-labwc-runtime")
+RUNTIME = Path(os.environ.get("RAVEN_TEST_RUNTIME") or f"/run/user/{os.getuid()}") / "raven-labwc-runtime"
 WINDOW = "title:frame restore"
 FAILURES = {
     10: "the compositor maximized the window and the program did not hear SC_MAXIMIZE",
@@ -66,7 +66,7 @@ def main():
         compositor = start_compositor(log)
         env = os.environ | environment() | {"RAVEN_PREFIX": str(work / "prefix")}
         env["PATH"] = os.environ["PATH"]
-        program = subprocess.Popen([str(raven), "--run-process", "--execution=native", "--timeout-ms=60000", "--desktop=wayland", str(fixture)],
+        program = subprocess.Popen([str(raven), "--run-process", "--execution=native", "--timeout-ms=60000", "--desktop=wayland", str(fixture), "--", "--host"],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         try:
             deadline = time.monotonic() + 20

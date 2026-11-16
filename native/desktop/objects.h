@@ -236,7 +236,13 @@ struct DesktopWindow {
 	bool visible = false;
 	bool painting = false, erase_pending = false;
 	DesktopRegion update{};
+	// A window with no client area still has its frame to paint once invalidated: on Windows the update region takes in the
+	// non-client area, and the WM_PAINT it raises has BeginPaint send WM_NCPAINT, as an empty MFC toolbar draws its gripper then.
+	bool frame_pending = false;
 	uint64_t update_generation=0;
+	// The update region is part of the client area: a window left with no client area has none to paint, whatever was invalidated
+	// while it had one. paint.net lays a label out to no height and makes a bitmap of its size when it paints.
+	bool needs_paint() const { return (!update.empty() && width>0 && height>0) || frame_pending; }
 	// Since when a top-level window has waited for its controls' paint before the compositor shows it (see NativeWindows::present).
 	std::optional<std::chrono::steady_clock::time_point> present_waiting{};
 	// Whether the window has been shown on the screen once: until then it waits longer for its first paint.
@@ -270,6 +276,8 @@ struct DesktopWindow {
 	// of the root it came from: a host window of its own would be placed by the compositor rather than where the program put it.
 	uint64_t shown_on = 0;
 	uint64_t order = 0;
+	// Windows links a new window into its parent's z-order only after WM_NCCREATE; until then sibling walks do not see it.
+	bool linked = true;
 	// Outer rectangle to return to when a maximized or minimized window is restored.
 	DesktopRect restore{};
 	std::map<std::u16string,uint64_t> properties{};
@@ -357,7 +365,8 @@ public:
 	std::vector<uint64_t> region_handles() const;
 	uint64_t window_root(uint64_t handle) const;
 	// Children of a window in z-order, bottom to top. Top-level windows are the children of window zero.
-	std::vector<uint64_t> child_windows(uint64_t parent) const;
+	// Bottom to top. A window still in WM_NCCREATE is listed only with `unlinked`, for the walks that end its parent.
+	std::vector<uint64_t> child_windows(uint64_t parent, bool unlinked = false) const;
 	// Moves a window to the top or bottom of its siblings.
 	void restack(uint64_t window,bool top);
 	bool is_child(uint64_t parent,uint64_t child) const;
@@ -365,6 +374,11 @@ public:
 	void configure_window_dc(uint64_t window,DesktopDC &device,bool frame) const;
 	uint64_t invalid_window(uint64_t filter) const;
 	std::vector<uint64_t> window_handles() const;
+	// The visible windows waiting to be painted, in handle order. A message loop asks at every call; the list is worked out again
+	// only after a window was handed out for change, added or erased, or the runtime said one may have changed (windows_changed).
+	const std::vector<uint64_t> &waiting_paint() const;
+	// A window handed out earlier can still be changed through the pointer kept: what the guest reads is brought up to date then.
+	void windows_changed() { ++window_generation; }
 	bool set_title(uint64_t window,std::u16string title);
 	bool invalidate(uint64_t window,DesktopRect rect,bool erase);
 	bool validate(uint64_t window,DesktopRect rect);
@@ -398,6 +412,9 @@ private:
 	std::map<uint64_t,uint32_t> selections;
 	// The windows among the objects, in handle order.
 	std::set<uint64_t> window_set;
+	uint64_t window_generation=0;
+	mutable uint64_t waiting_generation=~uint64_t(0);
+	mutable std::vector<uint64_t> waiting{};
 	void count_selection(uint64_t bitmap, int change)
 	{
 		if (!bitmap) return;

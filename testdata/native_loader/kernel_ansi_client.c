@@ -33,6 +33,17 @@ int raven_entry(void)
 	CloseHandle(file);
 	if (!CopyFileA("ansi-dir\\one.txt","ansi-dir\\two.txt",FALSE) || !MoveFileA("ansi-dir\\two.txt","ansi-dir\\three.txt")) return 6;
 	if (GetFileAttributesA("ansi-dir\\two.txt")!=INVALID_FILE_ATTRIBUTES || GetFileAttributesA("ansi-dir\\three.txt")==INVALID_FILE_ATTRIBUTES) return 7;
+	if (!MoveFileExA("ansi-dir\\three.txt","ansi-dir\\four.txt",0) || !MoveFileWithProgressA("ansi-dir\\four.txt","ansi-dir\\three.txt",NULL,NULL,0) ||
+		GetFileAttributesA("ansi-dir\\four.txt")!=INVALID_FILE_ATTRIBUTES) return 90;
+	/* A console program such as 7-Zip's switches the file functions to the OEM code page: 0x82 is e acute there, and in ANSI 0xe9 is. */
+	SetFileApisToOEM();
+	if (AreFileApisANSI()) return 91;
+	file=CreateFileA("ansi-dir\\\x82.txt",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+	if (file==INVALID_HANDLE_VALUE) return 92;
+	CloseHandle(file);
+	if (GetFileAttributesW(L"ansi-dir\\\x00e9.txt")==INVALID_FILE_ATTRIBUTES) return 93;
+	SetFileApisToANSI();
+	if (!AreFileApisANSI() || !DeleteFileA("ansi-dir\\\xe9.txt")) return 94;
 	file=CreateFileA("ansi-dir\\three.txt",GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
 	if (file==INVALID_HANDLE_VALUE || !ReadFile(file,buffer,sizeof buffer,&read,NULL) || read!=sizeof data-1) return 8;
 	CloseHandle(file);
@@ -46,6 +57,15 @@ int raven_entry(void)
 	if (GetFileAttributesA("ansi-dir")!=INVALID_FILE_ATTRIBUTES) return 13;
 	count=GetModuleFileNameA(NULL,path,MAX_PATH);
 	if (!count || count>=MAX_PATH || length(path)!=count || path[length(path)-1]!='e') return 14;
+	/* A name looked up in the activation context, as the .NET runtime does before it loads a library: the ANSI form answers as the
+	   wide one does. */
+	ACTCTX_SECTION_KEYED_DATA wide_data={sizeof wide_data},narrow_data={sizeof narrow_data};
+	SetLastError(0);
+	const BOOL wide_found=FindActCtxSectionStringW(0,NULL,ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION,L"comctl32.dll",&wide_data);
+	const DWORD wide_error=GetLastError();
+	SetLastError(0);
+	if (FindActCtxSectionStringA(0,NULL,ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION,"comctl32.dll",&narrow_data)!=wide_found ||
+		GetLastError()!=wide_error || narrow_data.ulDataFormatVersion!=wide_data.ulDataFormatVersion) return 95;
 	(void)copy;
 	return 0;
 }

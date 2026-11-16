@@ -38,6 +38,8 @@ public:
 		std::function<void(uint64_t window)> release;
 		// The client area of the window: what a Windows surface reports as its extent.
 		std::function<std::optional<std::pair<uint32_t, uint32_t>>(uint64_t window)> size;
+		// Whether the window's top-level window is on the screen.
+		std::function<bool(uint64_t window)> shown;
 		// The window system whose surface extension serves the Windows one.
 		HostPlatform platform = HostPlatform::wayland;
 	};
@@ -92,6 +94,9 @@ private:
 	struct Memory {
 		VkDeviceMemory handle; uint64_t device; VkDeviceSize size;
 		void *host = nullptr; uint64_t shadow = 0; VkDeviceSize offset = 0, mapped = 0;
+		// The range the driver maps: the guest's own for host-coherent memory, and for the other kinds the guest's widened to whole
+		// non-coherent atoms within the allocation, so the range flushed and invalidated is one the driver accepts.
+		VkDeviceSize host_offset = 0, host_size = 0;
 		uint64_t mapping_base = 0;
 		bool coherent = false;
 		// Host-cached memory reads back cheaply; the other host-visible kinds are write-combined, where every byte read is slow.
@@ -126,6 +131,10 @@ private:
 	// The instance token each of those surfaces was created from.
 	std::map<uint64_t, uint64_t> surface_instances;
 	std::set<uint64_t> foreign_surfaces;
+	// Surfaces over windows whose top-level window was hidden when they were made: they present nowhere, as on Windows, until the
+	// window is shown and they are lost, so the program makes them again over what the host shows.
+	std::set<uint64_t> hidden_surfaces;
+	bool hidden_surface_lost(uint64_t surface) const;
 	struct ForeignSwapchain;
 	std::map<uint64_t, std::shared_ptr<ForeignSwapchain>> foreign_swapchains;
 	VkResult prepare_foreign_swapchain(uint64_t token,uint64_t device,VkSwapchainKHR swapchain,
@@ -161,6 +170,8 @@ private:
 	void destroy_device(uint64_t token);
 	// Copies between a guest shadow and the host mapping behind it, moving only the bytes that changed on one side.
 	void shadow_to_device(uint64_t device);
+	// Flushes or invalidates the driver's whole mapping of memory that is not host-coherent.
+	void mapped_range(const Memory &memory, bool invalidate);
 	// Maps a shadow the guest and the host share, or releases one.
 	uint64_t make_shadow(Memory &memory, size_t size);
 	void drop_shadow(Memory &memory);

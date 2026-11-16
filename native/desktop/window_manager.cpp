@@ -43,6 +43,8 @@ std::vector<uint64_t> NativeWindows::top_level_windows() const
 
 uint64_t NativeWindows::window_at(int32_t x, int32_t y)
 {
+	if (pointer_away && x == cursor_x && y == cursor_y)
+		return 0;
 	auto roots = top_level_windows();
 	for (auto root = roots.rbegin(); root != roots.rend(); ++root) {
 		const auto *record = std::as_const(objects).window(*root);
@@ -151,9 +153,8 @@ bool NativeWindows::show_window(uint64_t handle, uint32_t command)
 			if (!is_min)
 				window->restore = window->outer;
 			window->style = (window->style & ~ws_minimize) | ws_maximize;
-			const auto frame = adjust_window_rect(objects.nonclient_metrics(), {0, 0, 0, 0}, window->style & ~ws_visible, window->menu != 0, window->ex_style);
-			(void)frame;
-			reshape(handle, {0, 0, screen.screen_x, screen.screen_y});
+			// The window hears of its new place as of any other: WM_WINDOWPOSCHANGED, which a program may lay its content out from.
+			place_window(handle, {0, 0, screen.screen_x, screen.screen_y}, 0, 0x14);
 		} else if (minimize && !is_min) {
 			if (!is_max)
 				window->restore = window->outer;
@@ -162,10 +163,28 @@ bool NativeWindows::show_window(uint64_t handle, uint32_t command)
 			window->style &= ~(ws_maximize | ws_minimize);
 			const auto target = window->restore.right > window->restore.left ? window->restore : window->outer;
 			if (is_max)
-				reshape(handle, target);
+				place_window(handle, target, 0, 0x14);
 		}
 		window = objects.window(handle);
 	}
+	if (window->parent && maximize && !(window->style & ws_maximize)) {
+		// A maximized child covers its parent's client area with its own. Its caption and border lie outside, where the parent clips
+		// them, as a document in an MDI client.
+		const auto *parent = std::as_const(objects).window(window->parent);
+		if (!parent)
+			throw uint32_t(1400);
+		window->restore = window->outer;
+		window->style |= ws_maximize;
+		place_window(handle, adjust_window_rect(objects.nonclient_metrics(), {parent->x, parent->y, parent->x + parent->width, parent->y + parent->height},
+			window->style & ~ws_visible, false, window->ex_style), 0, 0x14);
+		window = objects.window(handle);
+	} else if (window->parent && (command == 9 || command == 1 || command == 10) && (window->style & ws_maximize)) {
+		window->style &= ~ws_maximize;
+		place_window(handle, window->restore, 0, 0x14);
+		window = objects.window(handle);
+	}
+	if (!window)
+		throw uint32_t(1400);
 	const bool show = !hide && !(window->style & ws_minimize && !window->parent);
 	if (show && (!window->parent || objects.window_visible(window->parent)))
 		present(handle);
@@ -279,15 +298,14 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 			objects.restack(handle, true);
 		else {
 			objects.restack(handle, true);
-			// Insert directly above the named sibling: every sibling above it climbs over this window.
+			// The window goes directly below the named sibling, which precedes it: that sibling and every one above it climb over it.
 			const auto *sibling = std::as_const(objects).window(after);
 			auto *self = objects.window(handle);
 			if (sibling && self) {
 				self->order = sibling->order;
 				for (const auto other : objects.child_windows(window->parent))
-					if (other != handle && std::as_const(objects).window(other)->order >= sibling->order && other != after)
+					if (other != handle && std::as_const(objects).window(other)->order >= self->order)
 						++objects.window(other)->order;
-				++self->order;
 			}
 		}
 		window = objects.window(handle);
@@ -326,6 +344,11 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 	} placing_guard{placing, handle, placing.insert(handle).second};
 	if (shifted && !resized && !window->parent) {
 		shift_window(handle, target.left - old.left, target.top - old.top);
+		// A window shown on its owner's lies there by where it is from the owner: moved, it is shown again in its new place.
+		if (was_visible) {
+			dirty_roots.insert(handle);
+			dirty_whole.insert(handle);
+		}
 	} else if (shifted || resized) {
 		const auto old_client_x = window->x, old_client_y = window->y;
 		if (window->parent && was_visible)
@@ -363,6 +386,16 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 	window = objects.window(handle);
 	if (!window)
 		return;
+	// The windows shown on this one's, the ones it owns, lie there by where they are from it: they are shown again where that puts
+	// them now.
+	if (!window->parent && (shifted || resized))
+		for (const auto other : objects.window_handles()) {
+			const auto *owned = std::as_const(objects).window(other);
+			if (owned && other != handle && owned->visible && host_owner(*owned) == handle && shown_on_owner(*owned)) {
+				dirty_roots.insert(other);
+				dirty_whole.insert(other);
+			}
+		}
 	// SWP_FRAMECHANGED asks the window for its client area again, as a program that draws its own frame does after it changes.
 	if ((effective & 0x20) && !(shifted || resized)) {
 		recalculate_client(handle);
@@ -370,8 +403,9 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 		if (!window)
 			return;
 	}
+	// With SWP_NOACTIVATE the window shows where it is put without taking the activation, as a tooltip does (SW_SHOWNA).
 	if (effective & swp_showwindow)
-		show_window(handle, 5);
+		show_window(handle, (effective & swp_noactivate) ? 8 : 5);
 	else if (effective & swp_hidewindow)
 		show_window(handle, 0);
 	if (!std::as_const(objects).window(handle))
@@ -519,7 +553,8 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 		switch (call.u32(1)) {
 		case 0: call.ret(siblings.empty() ? 0 : siblings.back()); break;
 		case 1: call.ret(siblings.empty() ? 0 : siblings.front()); break;
-		case 2: call.ret(position == siblings.begin() ? 0 : *(position - 1)); break;
+		// A window still in WM_NCCREATE is not among its siblings and has no neighbors.
+		case 2: call.ret(position == siblings.end() || position == siblings.begin() ? 0 : *(position - 1)); break;
 		case 3: call.ret(position == siblings.end() || position + 1 == siblings.end() ? 0 : *(position + 1)); break;
 		case 4: call.ret(window->owner); break;
 		case 5: {
@@ -898,7 +933,10 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 			return;
 		}
 		const bool minimized = window->style & ws_minimize, maximized = window->style & ws_maximize;
-		const DesktopRect normal = (minimized || maximized) && window->restore.right > window->restore.left ? window->restore : window->outer;
+		DesktopRect normal = (minimized || maximized) && window->restore.right > window->restore.left ? window->restore : window->outer;
+		// A child window's place is in its parent's client coordinates, as MoveWindow takes it.
+		if (const auto *parent = window->parent ? objects.window(window->parent) : nullptr)
+			normal = {normal.left - parent->x, normal.top - parent->y, normal.right - parent->x, normal.bottom - parent->y};
 		std::vector<uint8_t> bytes(44);
 		const uint32_t fields[11] = {44, 0, uint32_t(minimized ? 2 : maximized ? 3 : window->visible ? 1 : 0), UINT32_MAX, UINT32_MAX, UINT32_MAX,
 			UINT32_MAX, uint32_t(normal.left), uint32_t(normal.top), uint32_t(normal.right), uint32_t(normal.bottom)};
@@ -920,7 +958,9 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 			return;
 		}
 		try {
-			const DesktopRect normal{int32_t(fields[7]), int32_t(fields[8]), int32_t(fields[9]), int32_t(fields[10])};
+			const auto *parent = window->parent ? objects.window(window->parent) : nullptr;
+			const int32_t ox = parent ? parent->x : 0, oy = parent ? parent->y : 0;
+			const DesktopRect normal{int32_t(fields[7]) + ox, int32_t(fields[8]) + oy, int32_t(fields[9]) + ox, int32_t(fields[10]) + oy};
 			objects.window(call[0])->restore = normal;
 			// The window becomes visible before it is sized, so its size notifications reach a window that is already shown.
 			if (fields[2] != 0)
@@ -989,7 +1029,7 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 				for (const auto root : top_level_windows())
 					apply(apply, root, rect, true);
 			if (flags & 0x100) {
-				if (std::as_const(objects).window(handle) && !std::as_const(objects).window(handle)->update.empty())
+				if (std::as_const(objects).window(handle) && std::as_const(objects).window(handle)->needs_paint())
 					send(handle, 0x0f, 0, 0);
 			}
 			call.ret(1);
@@ -1009,12 +1049,92 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 	});
 	// Layered window attributes are kept per window for GetLayeredWindowAttributes; the compositor draws windows opaque.
 	auto layered = std::make_shared<std::map<uint64_t, std::array<uint32_t, 3>>>();
-	registry.add("UpdateLayeredWindow", 9, [this](ApiCall &call) {
-		if (!std::as_const(objects).window(call[0])) {
+	// A layered window shows what the program hands over: the window moves and takes the size given, and the pixels of the source DC
+	// become its surface. Pixels with per-pixel alpha are premultiplied, as the compositor blends them; the constant alpha scales them
+	// all. Without per-pixel alpha the window is opaque, and the color key shows black.
+	const auto update_layered = [this](ApiCall &call, uint64_t handle, uint64_t destination, uint64_t extent, uint64_t source_dc,
+										  uint64_t source_point, uint32_t key, uint64_t blend, uint32_t flags) {
+		const auto *window = std::as_const(objects).window(handle);
+		if (!window) {
 			call.fail(1400);
 			return;
 		}
-		call.ret(1);
+		DesktopRect outer = window->outer;
+		if (destination) {
+			const int32_t x = call.load<int32_t>(destination), y = call.load<int32_t>(destination + 4);
+			outer = {x, y, x + (outer.right - outer.left), y + (outer.bottom - outer.top)};
+		}
+		if (extent)
+			outer.right = outer.left + std::max(call.load<int32_t>(extent), 0), outer.bottom = outer.top + std::max(call.load<int32_t>(extent + 4), 0);
+		try {
+			if (destination || extent)
+				place_window(handle, outer, 0, swp_nozorder | swp_noactivate);
+			const auto *source = source_dc ? std::as_const(objects).dc(source_dc) : nullptr;
+			const auto *image = source ? std::as_const(objects).bitmap(source->bitmap) : nullptr;
+			if (!image || image->depth != 32 || !objects.window_visible(handle)) {
+				call.ret(1);
+				return;
+			}
+			surface_dc(handle);
+			window = std::as_const(objects).window(handle);
+			auto *surface = objects.bitmap(window->bitmap);
+			if (!surface) {
+				call.ret(1);
+				return;
+			}
+			const int32_t sx = source_point ? call.load<int32_t>(source_point) : 0, sy = source_point ? call.load<int32_t>(source_point + 4) : 0;
+			const uint32_t constant = blend ? call.load<uint8_t>(blend + 2) : 255;
+			const bool alpha = (flags & 2) && blend && (call.load<uint8_t>(blend + 3) & 1);
+			const auto from = image->pixels();
+			auto to = surface->pixels();
+			const size_t source_stride = image->stride ? image->stride : size_t(image->width) * 4;
+			for (uint32_t y = 0; y < surface->height; ++y)
+				for (uint32_t x = 0; x < surface->width; ++x) {
+					uint8_t pixel[4] = {0, 0, 0, 0};
+					const int64_t u = int64_t(sx) + x, v = int64_t(sy) + y;
+					if (u >= 0 && v >= 0 && u < image->width && v < image->height) {
+						const size_t row = image->top_down ? size_t(v) : size_t(image->height - 1 - v);
+						const size_t at = row * source_stride + size_t(u) * 4;
+						if (at + 4 <= from.size())
+							std::memcpy(pixel, from.data() + at, 4);
+						const uint32_t color = pixel[2] | uint32_t(pixel[1]) << 8 | uint32_t(pixel[0]) << 16;
+						if ((flags & 1) && color == (key & 0xffffffU))
+							pixel[0] = pixel[1] = pixel[2] = 0;
+						if (!alpha)
+							pixel[3] = 255;
+						if (constant != 255)
+							for (int channel = 0; channel < 4; ++channel)
+								pixel[channel] = uint8_t(pixel[channel] * constant / 255);
+					}
+					const size_t at = (size_t(y) * surface->width + x) * 4;
+					if (at + 4 <= to.size())
+						std::memcpy(to.data() + at, pixel, 4);
+				}
+			auto *painted = objects.window(handle);
+			painted->painted = true;
+			if (presentation.translucent)
+				presentation.translucent(handle, alpha || constant != 255);
+			present(handle, true);
+			call.ret(1);
+		} catch (const uint32_t &error) {
+			call.fail(error);
+		}
+	};
+	registry.add("UpdateLayeredWindow", 9, [update_layered](ApiCall &call) {
+		update_layered(call, call[0], call[2], call[3], call[4], call[5], call.u32(6), call[7], call.u32(8));
+	});
+	// UPDATELAYEREDWINDOWINFO: its size, the destination DC, the position, the size, the source DC and point, the key, the blend, the
+	// flags and the dirty rectangle, pointers at the width of the program.
+	registry.add("UpdateLayeredWindowIndirect", 2, [update_layered](ApiCall &call) {
+		if (!call[1]) {
+			call.fail(87);
+			return;
+		}
+		const uint64_t info = call[1], word = call.pointer_width();
+		const auto field = [&](uint32_t index) { return call.load_pointer(info + word + index * word); };
+		const uint64_t key_at = info + word * 6, blend_at = key_at + word;
+		update_layered(call, call[0], field(1), field(2), field(3), field(4), call.load<uint32_t>(key_at), call.load_pointer(blend_at),
+			call.load<uint32_t>(blend_at + word));
 	});
 	registry.add("SetLayeredWindowAttributes", 4, [this, layered](ApiCall &call) {
 		if (!std::as_const(objects).window(call[0])) {

@@ -21,7 +21,7 @@ from PIL import Image, ImageChops
 
 from x11_session import X11Session
 
-RUNTIME = Path(f"/run/user/{os.getuid()}/raven-labwc-runtime")
+RUNTIME = Path(os.environ.get("RAVEN_TEST_RUNTIME") or f"/run/user/{os.getuid()}") / "raven-labwc-runtime"
 FIRST = b"Session one line\r\nsecond line, saved by session 1"
 SECOND = FIRST + b"\r\nappended by session 2"
 # The X server of an x11 run; None on Wayland.
@@ -195,7 +195,8 @@ def main():
 
 def workflow(raven, source, evidence):
     program_directory = evidence / "notepad"
-    shutil.copytree(source, program_directory)
+    # A portable Notepad++ keeps its session and unsaved tabs beside itself: a copy that was ever started would reopen them.
+    shutil.copytree(source, program_directory, ignore=shutil.ignore_patterns("backup", "session.xml*"))
     program = program_directory / "notepad++.exe"
     prefix = evidence / "prefix"
     saved = prefix / "drive_c" / "persist.txt"

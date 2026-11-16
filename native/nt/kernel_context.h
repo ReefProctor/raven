@@ -48,6 +48,9 @@ struct KernelContext {
 	bool shutdown_in_progress = false;
 	// Delivers a CPU fault to the guest's handlers; never returns normally (it redirects or ends the process).
 	std::function<void(const NativeResult &)> raise_fault;
+	// At an API call made inside callbacks: ends those the guest has left without returning, and makes the call again at the nesting
+	// its stack belongs to (it then never returns).
+	std::function<void()> leave_abandoned_callbacks;
 	// Walks the guest stack with the unwind tables and names each caller as module+offset (diagnostics only).
 	std::function<std::string()> describe_stack;
 	// Current and new queue categories for a thread; the last argument clears the requested new bits.
@@ -83,7 +86,7 @@ void register_registry_api(ApiRegistry &registry, KernelContext &context, Native
 void apply_registry_settings(NativeRegistry &hive);
 void register_service_api(ApiRegistry &registry, KernelContext &context, NativeRegistry &hive);
 void register_platform_api(ApiRegistry &registry, KernelContext &context);
-void register_shell_api(ApiRegistry &registry, KernelContext &context);
+void register_shell_api(ApiRegistry &registry, KernelContext &context, NativeRegistry &hive);
 void register_version_api(ApiRegistry &registry, KernelContext &context);
 void register_shlwapi_api(ApiRegistry &registry, KernelContext &context);
 void register_file_api(ApiRegistry &registry, KernelContext &context);
@@ -129,6 +132,7 @@ void register_process_info_api(ApiRegistry &registry, KernelContext &context);
 void register_crypt32_api(ApiRegistry &registry, KernelContext &context);
 void register_bcrypt_api(ApiRegistry &registry, KernelContext &context);
 void register_font_service(ApiRegistry &registry, KernelContext &context);
+void register_sandbox_api(ApiRegistry &registry, KernelContext &context);
 // The HLSL compiler behind d3dcompiler_47.dll: requests from the guest component, results read back in parts.
 void register_shader_service(ApiRegistry &registry, KernelContext &context);
 // The sound engine for the guest's audio components: streams whose samples and counters live in a page the guest maps (raven_audio.h).

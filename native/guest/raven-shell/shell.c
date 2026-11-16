@@ -23,16 +23,6 @@
 
 #include "shell.h"
 
-void copy_text(WCHAR *to, size_t capacity, const WCHAR *from)
-{
-	size_t length = from ? lstrlenW(from) : 0;
-	if (length >= capacity)
-		length = capacity - 1;
-	if (length)
-		memcpy(to, from, length * sizeof(WCHAR));
-	to[length] = 0;
-}
-
 /* RAVEN_TRACE_SHELL names a file that receives one line per interface request and dialog call. */
 static void trace(const char *text, const GUID *iid)
 {
@@ -58,96 +48,6 @@ static void trace(const char *text, const GUID *iid)
 		return;
 	WriteFile(file, line, count, &written, NULL);
 	CloseHandle(file);
-}
-
-static BOOL is_separator(WCHAR c)
-{
-	return c == L'\\' || c == L'/';
-}
-
-/* Joins a directory and a name with a single separator. */
-void join_path(WCHAR *out, size_t capacity, const WCHAR *dir, const WCHAR *name)
-{
-	size_t length;
-	copy_text(out, capacity, dir);
-	length = lstrlenW(out);
-	if (length && !is_separator(out[length - 1]) && length + 1 < capacity)
-		out[length++] = L'\\', out[length] = 0;
-	if (length + lstrlenW(name) < capacity)
-		lstrcatW(out, name);
-}
-
-BOOL is_absolute(const WCHAR *path)
-{
-	return is_separator(path[0]) || (path[0] && path[1] == L':');
-}
-
-const WCHAR *file_part(const WCHAR *path)
-{
-	const WCHAR *last = path;
-	for (; *path; ++path)
-		if (is_separator(*path) || *path == L':')
-			last = path + 1;
-	return last;
-}
-
-void parent_directory(WCHAR *dir)
-{
-	size_t length = lstrlenW(dir);
-	while (length > 3 && is_separator(dir[length - 1]))
-		dir[--length] = 0;
-	while (length > 3 && !is_separator(dir[length - 1]))
-		dir[--length] = 0;
-	while (length > 3 && is_separator(dir[length - 1]))
-		dir[--length] = 0;
-	if (length == 2 && dir[1] == L':')
-		dir[length++] = L'\\', dir[length] = 0;
-}
-
-static WCHAR fold(WCHAR c)
-{
-	return c >= L'A' && c <= L'Z' ? (WCHAR)(c + 32) : c;
-}
-
-/* Case-insensitive wildcard match of one pattern ('*' and '?') against a file name. */
-static BOOL match_pattern(const WCHAR *pattern, const WCHAR *name)
-{
-	while (*pattern) {
-		if (*pattern == L'*') {
-			while (*pattern == L'*')
-				++pattern;
-			if (!*pattern)
-				return TRUE;
-			for (; *name; ++name)
-				if (match_pattern(pattern, name))
-					return TRUE;
-			return FALSE;
-		}
-		if (!*name || (*pattern != L'?' && fold(*pattern) != fold(*name)))
-			return FALSE;
-		++pattern;
-		++name;
-	}
-	return !*name;
-}
-
-/* A filter specification is a semicolon separated list of patterns. */
-BOOL match_spec(const WCHAR *spec, const WCHAR *name)
-{
-	WCHAR one[128];
-	while (*spec) {
-		size_t length = 0;
-		while (*spec == L';' || *spec == L' ')
-			++spec;
-		while (spec[length] && spec[length] != L';' && length < 127)
-			++length;
-		memcpy(one, spec, length * sizeof(WCHAR));
-		one[length] = 0;
-		if (length && match_pattern(one, name))
-			return TRUE;
-		spec += length;
-	}
-	return FALSE;
 }
 
 /* Shell items ----------------------------------------------------------------------------------------------- */
@@ -200,12 +100,53 @@ static HRESULT STDMETHODCALLTYPE item_bind(IShellItem *self, IBindCtx *context, 
 
 static HRESULT STDMETHODCALLTYPE item_parent(IShellItem *self, IShellItem **parent);
 
+/* SIGDN_URL: a file URL, file:///C:/folder/name, with the characters a URL does not carry as they are escaped as UTF-8. */
+static WCHAR *file_url(const WCHAR *path)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	const size_t length = lstrlenW(path);
+	WCHAR *url = CoTaskMemAlloc((8 + length * 9 + 1) * sizeof(WCHAR));
+	size_t at = 0, index;
+	if (!url)
+		return NULL;
+	for (index = 0; index < 8; ++index)
+		url[at++] = L"file:///"[index];
+	for (index = 0; index < length; ++index) {
+		const WCHAR c = path[index];
+		unsigned char bytes[4];
+		int count = 0, byte;
+		if (c == L'\\') {
+			url[at++] = L'/';
+			continue;
+		}
+		if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'-' || c == L'.' || c == L'_' ||
+			c == L'~' || c == L':' || c == L'/') {
+			url[at++] = c;
+			continue;
+		}
+		count = WideCharToMultiByte(CP_UTF8, 0, path + index, IS_HIGH_SURROGATE(c) && index + 1 < length ? 2 : 1, (char *)bytes, 4, NULL, NULL);
+		if (IS_HIGH_SURROGATE(c) && index + 1 < length)
+			++index;
+		for (byte = 0; byte < count; ++byte) {
+			url[at++] = L'%';
+			url[at++] = hex[bytes[byte] >> 4];
+			url[at++] = hex[bytes[byte] & 15];
+		}
+	}
+	url[at] = 0;
+	return url;
+}
+
 static HRESULT STDMETHODCALLTYPE item_display_name(IShellItem *self, SIGDN kind, LPWSTR *name)
 {
 	const WCHAR *source = ((Item *)self)->path;
 	size_t length;
 	WCHAR *copy;
-	if ((DWORD)kind != 0x80058000 && (DWORD)kind != 0x80028000 && (DWORD)kind != 0x8004c000 && (DWORD)kind != 0x80068000)
+	if ((DWORD)kind == 0x80068000) {
+		*name = file_url(source);
+		return *name ? S_OK : E_OUTOFMEMORY;
+	}
+	if ((DWORD)kind != 0x80058000 && (DWORD)kind != 0x80028000 && (DWORD)kind != 0x8004c000)
 		source = file_part(source);
 	length = lstrlenW(source);
 	copy = CoTaskMemAlloc((length + 1) * sizeof(WCHAR));
@@ -324,6 +265,7 @@ typedef struct {
 	LONG refs;
 	BOOL save;
 	DialogState state;
+	IFileDialogEvents *events; /* the program's handler, told what the person did before Show returns */
 } FileDialog;
 
 static FileDialog *dialog_of(void *self) { return (FileDialog *)self; }
@@ -353,8 +295,11 @@ static ULONG STDMETHODCALLTYPE fd_add_ref(void *self) { return (ULONG)Interlocke
 static ULONG STDMETHODCALLTYPE fd_release(void *self)
 {
 	LONG left = InterlockedDecrement(&dialog_of(self)->refs);
-	if (!left)
+	if (!left) {
+		if (dialog_of(self)->events)
+			IFileDialogEvents_Release(dialog_of(self)->events);
 		HeapFree(GetProcessHeap(), 0, self);
+	}
 	return (ULONG)left;
 }
 
@@ -362,10 +307,19 @@ static HRESULT STDMETHODCALLTYPE fd_show(void *self, HWND owner)
 {
 	FileDialog *dialog = dialog_of(self);
 	trace("dialog Show", NULL);
-	dialog->state.has_result = FALSE;
-	if (!run_dialog(owner, &dialog->state))
-		return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-	return S_OK;
+	for (;;) {
+		dialog->state.has_result = FALSE;
+		if (!run_dialog(owner, &dialog->state))
+			return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+		/* The handler hears of the folder and the selection the person ended in, then of the choice itself: many programs read the
+		 * results there and only there. A handler that refuses the choice keeps the dialog open, so it is shown again. */
+		if (!dialog->events)
+			return S_OK;
+		IFileDialogEvents_OnFolderChange(dialog->events, (IFileDialog *)self);
+		IFileDialogEvents_OnSelectionChange(dialog->events, (IFileDialog *)self);
+		if (IFileDialogEvents_OnFileOk(dialog->events, (IFileDialog *)self) != S_FALSE)
+			return S_OK;
+	}
 }
 
 static HRESULT STDMETHODCALLTYPE fd_set_types(void *self, UINT count, const COMDLG_FILTERSPEC *specs)
@@ -386,8 +340,29 @@ static HRESULT STDMETHODCALLTYPE fd_set_types(void *self, UINT count, const COMD
 
 static HRESULT STDMETHODCALLTYPE fd_set_index(void *self, UINT index) { dialog_of(self)->state.filter_index = index; return S_OK; }
 static HRESULT STDMETHODCALLTYPE fd_get_index(void *self, UINT *index) { *index = dialog_of(self)->state.filter_index; return S_OK; }
-static HRESULT STDMETHODCALLTYPE fd_advise(void *self, IFileDialogEvents *events, DWORD *cookie) { *cookie = 1; return S_OK; }
-static HRESULT STDMETHODCALLTYPE fd_unadvise(void *self, DWORD cookie) { return S_OK; }
+/* One handler at a time, which is all a dialog shown by one program needs; the cookie names it. */
+static HRESULT STDMETHODCALLTYPE fd_advise(void *self, IFileDialogEvents *events, DWORD *cookie)
+{
+	FileDialog *dialog = dialog_of(self);
+	if (!events || !cookie)
+		return E_INVALIDARG;
+	IFileDialogEvents_AddRef(events);
+	if (dialog->events)
+		IFileDialogEvents_Release(dialog->events);
+	dialog->events = events;
+	*cookie = 1;
+	return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE fd_unadvise(void *self, DWORD cookie)
+{
+	FileDialog *dialog = dialog_of(self);
+	if (cookie != 1 || !dialog->events)
+		return E_INVALIDARG;
+	IFileDialogEvents_Release(dialog->events);
+	dialog->events = NULL;
+	return S_OK;
+}
 static HRESULT STDMETHODCALLTYPE fd_set_options(void *self, FILEOPENDIALOGOPTIONS options) { dialog_of(self)->state.options = options; return S_OK; }
 static HRESULT STDMETHODCALLTYPE fd_get_options(void *self, FILEOPENDIALOGOPTIONS *options) { *options = dialog_of(self)->state.options; return S_OK; }
 
@@ -892,6 +867,37 @@ HRESULT WINAPI SHCreateItemFromIDList(PCIDLIST_ABSOLUTE list, REFIID iid, void *
 	return SHCreateItemFromParsingName(path, NULL, iid, out);
 }
 
+PIDLIST_ABSOLUTE WINAPI ILCombine(PCIDLIST_ABSOLUTE first, PCUIDLIST_RELATIVE second);
+void WINAPI ILFree(PIDLIST_RELATIVE list);
+
+/* The item a list names, relative to a parent list or to a folder that knows its own, or absolute when neither is given. */
+HRESULT WINAPI SHCreateShellItem(PCIDLIST_ABSOLUTE parent, IShellFolder *folder, PCUITEMID_CHILD child, IShellItem **out)
+{
+	if (!out)
+		return E_POINTER;
+	*out = NULL;
+	if (!child)
+		return E_INVALIDARG;
+	PIDLIST_ABSOLUTE own = NULL;
+	if (!parent && folder) {
+		IPersistFolder2 *persist = NULL;
+		if (FAILED(IShellFolder_QueryInterface(folder, &IID_IPersistFolder2, (void **)&persist)))
+			return E_INVALIDARG;
+		HRESULT result = IPersistFolder2_GetCurFolder(persist, &own);
+		IPersistFolder2_Release(persist);
+		if (FAILED(result))
+			return result;
+		parent = own;
+	}
+	PIDLIST_ABSOLUTE whole = parent ? ILCombine(parent, (PCUIDLIST_RELATIVE)child) : NULL;
+	HRESULT result = SHCreateItemFromIDList(whole ? whole : (PCIDLIST_ABSOLUTE)child, &IID_IShellItem, (void **)out);
+	if (whole)
+		ILFree((PIDLIST_RELATIVE)whole);
+	if (own)
+		ILFree((PIDLIST_RELATIVE)own);
+	return result;
+}
+
 HRESULT WINAPI SHCreateItemFromParsingName(PCWSTR path, IBindCtx *context, REFIID iid, void **out)
 {
 	IShellItem *item;
@@ -999,9 +1005,10 @@ static BOOL classic_dialog(OPENFILENAMEW *request, BOOL save)
 			request->nFilterIndex = state->filter_index;
 		}
 	} else if (accepted) {
-		size_t length = lstrlenW(state->result);
-		if (!request->lpstrFile || length + 1 > request->nMaxFile) {
-			request->nMaxFile = (DWORD)(length + 1);
+		/* A dialog that allows several files ends even one with a second null, which ends the list of names after the path. */
+		const size_t length = lstrlenW(state->result), ends = (request->Flags & OFN_ALLOWMULTISELECT) ? 2 : 1;
+		if (!request->lpstrFile || length + ends > request->nMaxFile) {
+			request->nMaxFile = (DWORD)(length + ends);
 			accepted = FALSE;
 			SetLastError(ERROR_INSUFFICIENT_BUFFER);
 		} else {
@@ -1009,6 +1016,7 @@ static BOOL classic_dialog(OPENFILENAMEW *request, BOOL save)
 			const WCHAR *dot = NULL;
 			const WCHAR *scan;
 			lstrcpyW(request->lpstrFile, state->result);
+			request->lpstrFile[length + ends - 1] = 0;
 			request->nFileOffset = (WORD)(name - state->result);
 			for (scan = name; *scan; ++scan)
 				if (*scan == L'.')
@@ -1041,8 +1049,8 @@ short WINAPI GetFileTitleW(LPCWSTR file, LPWSTR title, WORD size)
 	return 0;
 }
 
-/* A window's property store: the values a program sets on it (its application id, for one) kept in memory for as long as the process
-   runs. Strings are copied; other values are kept as they are. */
+/* A property store in memory: a window's, which keeps the values a program sets on it (its application id, for one) for as long as
+   the process runs, or a shell link's (see create_memory_store). Strings are copied; other values are kept as they are. */
 typedef struct {
 	PROPERTYKEY key;
 	PROPVARIANT value;
@@ -1050,6 +1058,7 @@ typedef struct {
 
 typedef struct {
 	IPropertyStore store;
+	LONG refs;
 	HWND window;
 	StoredProperty *items;
 	DWORD count;
@@ -1082,12 +1091,25 @@ static HRESULT WINAPI store_query(IPropertyStore *self, REFIID iid, void **out)
 		return E_POINTER;
 	if (InlineIsEqualGUID(iid, &IID_IUnknown) || InlineIsEqualGUID(iid, &IID_IPropertyStore)) {
 		*out = self;
+		InterlockedIncrement(&((WindowStore *)self)->refs);
 		return S_OK;
 	}
 	*out = NULL;
 	return E_NOINTERFACE;
 }
-static ULONG WINAPI store_reference(IPropertyStore *self) { return 1; }
+static ULONG WINAPI store_reference(IPropertyStore *self) { return (ULONG)InterlockedIncrement(&((WindowStore *)self)->refs); }
+static ULONG WINAPI store_release(IPropertyStore *self)
+{
+	WindowStore *store = (WindowStore *)self;
+	const LONG left = InterlockedDecrement(&store->refs);
+	if (!left) {
+		for (DWORD index = 0; index < store->count; ++index)
+			PropVariantClear(&store->items[index].value);
+		HeapFree(GetProcessHeap(), 0, store->items);
+		HeapFree(GetProcessHeap(), 0, store);
+	}
+	return (ULONG)left;
+}
 static HRESULT WINAPI store_count(IPropertyStore *self, DWORD *count)
 {
 	if (!count)
@@ -1143,7 +1165,19 @@ static HRESULT WINAPI store_set(IPropertyStore *self, REFPROPERTYKEY key, REFPRO
 }
 static HRESULT WINAPI store_commit(IPropertyStore *self) { return S_OK; }
 
-static IPropertyStoreVtbl store_table = {store_query, store_reference, store_reference, store_count, store_at, store_get, store_set, store_commit};
+static IPropertyStoreVtbl store_table = {store_query, store_reference, store_release, store_count, store_at, store_get, store_set, store_commit};
+
+/* An empty store of the process's own, which goes when its last reference does. */
+HRESULT create_memory_store(IPropertyStore **out)
+{
+	WindowStore *store = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WindowStore));
+	if (!store)
+		return E_OUTOFMEMORY;
+	store->store.lpVtbl = &store_table;
+	store->refs = 1;
+	*out = &store->store;
+	return S_OK;
+}
 
 HRESULT WINAPI SHGetPropertyStoreForWindow(HWND window, REFIID iid, void **out)
 {
@@ -1164,6 +1198,8 @@ HRESULT WINAPI SHGetPropertyStoreForWindow(HWND window, REFIID iid, void **out)
 		if (!store || !grown)
 			return E_OUTOFMEMORY;
 		store->store.lpVtbl = &store_table;
+		/* The list of windows holds one reference, so a window's store stays while the process runs. */
+		store->refs = 1;
 		store->window = window;
 		window_stores = grown;
 		window_stores[window_store_count++] = store;
@@ -1335,13 +1371,20 @@ UINT_PTR WINAPI SHAppBarMessage(DWORD message, PAPPBARDATA data)
 struct icon_search {
 	int wanted, seen;
 	LPWSTR found;
+	/* A group named by a string, as 7z.dll's first one is ("0"): the name lasts only while the resources are listed, so it is kept. */
+	WCHAR name[64];
 };
 
 static BOOL CALLBACK icon_group(HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR context)
 {
 	struct icon_search *search = (struct icon_search *)context;
 	if (search->wanted >= 0 && search->seen++ == search->wanted) {
-		search->found = name;
+		if (IS_INTRESOURCE(name)) {
+			search->found = name;
+		} else if (lstrlenW(name) < (int)(sizeof search->name / sizeof *search->name)) {
+			lstrcpyW(search->name, name);
+			search->found = search->name;
+		}
 		return FALSE;
 	}
 	if (search->wanted < 0)
@@ -1355,7 +1398,8 @@ static BOOL icon_file(LPCWSTR file)
 	return length > 4 && !lstrcmpiW(file + length - 4, L".ico");
 }
 
-UINT WINAPI ExtractIconExW(LPCWSTR file, int index, HICON *large, HICON *small, UINT count)
+/* Icons of the sizes asked for, zero for the system's large and small icon sizes. */
+static UINT extract_sized(LPCWSTR file, int index, HICON *large, HICON *small, UINT count, int large_size, int small_size)
 {
 	HMODULE module;
 	struct icon_search search = {-1, 0, NULL};
@@ -1368,9 +1412,9 @@ UINT WINAPI ExtractIconExW(LPCWSTR file, int index, HICON *large, HICON *small, 
 		if (index != 0 || !count)
 			return 0;
 		if (large)
-			*large = LoadImageW(NULL, file, IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE);
+			*large = LoadImageW(NULL, file, IMAGE_ICON, large_size, large_size, LR_LOADFROMFILE);
 		if (small)
-			*small = LoadImageW(NULL, file, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE);
+			*small = LoadImageW(NULL, file, IMAGE_ICON, small_size, small_size, LR_LOADFROMFILE);
 		return (large && *large) || (small && *small) ? 1 : 0;
 	}
 	if (!(module = LoadLibraryExW(file, NULL, LOAD_LIBRARY_AS_DATAFILE)))
@@ -1397,9 +1441,9 @@ UINT WINAPI ExtractIconExW(LPCWSTR file, int index, HICON *large, HICON *small, 
 			name = search.found;
 		}
 		if (large)
-			big = LoadImageW(module, name, IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+			big = LoadImageW(module, name, IMAGE_ICON, large_size, large_size, 0);
 		if (small)
-			little = LoadImageW(module, name, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+			little = LoadImageW(module, name, IMAGE_ICON, small_size, small_size, 0);
 		if ((large && !big) || (small && !little)) {
 			if (big)
 				DestroyIcon(big);
@@ -1414,6 +1458,33 @@ UINT WINAPI ExtractIconExW(LPCWSTR file, int index, HICON *large, HICON *small, 
 	}
 	FreeLibrary(module);
 	return made;
+}
+
+UINT WINAPI ExtractIconExW(LPCWSTR file, int index, HICON *large, HICON *small, UINT count)
+{
+	return extract_sized(file, index, large, small, count, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CXSMICON));
+}
+
+/* The shell's default icon extraction: one large and one small icon, their sizes in the low and high words of the last argument, zero
+   for the system's sizes; S_FALSE when the file has no icon at that index. */
+HRESULT WINAPI SHDefExtractIconW(LPCWSTR file, int index, UINT flags, HICON *large, HICON *small, UINT sizes)
+{
+	const int large_size = LOWORD(sizes) ? LOWORD(sizes) : GetSystemMetrics(SM_CXICON);
+	const int small_size = HIWORD(sizes) ? HIWORD(sizes) : GetSystemMetrics(SM_CXSMICON);
+	if (!file)
+		return E_INVALIDARG;
+	if (large)
+		*large = NULL;
+	if (small)
+		*small = NULL;
+	if (!large && !small)
+		return extract_sized(file, -1, NULL, NULL, 0, large_size, small_size) > (UINT)(index < 0 ? 0 : index) ? S_OK : S_FALSE;
+	return extract_sized(file, index, large, small, 1, large_size, small_size) ? S_OK : S_FALSE;
+}
+
+UINT shell_icons(LPCWSTR file, int index, HICON *large, HICON *small, UINT count)
+{
+	return ExtractIconExW(file, index, large, small, count);
 }
 
 HICON WINAPI ExtractIconW(HINSTANCE instance, LPCWSTR file, UINT index)

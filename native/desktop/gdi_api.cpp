@@ -126,7 +126,7 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 	// Marks the window behind a leased DC as changed so the next message retrieval presents it.
 	const auto touched = [this](const DesktopDC &dc) {
 		if (dc.window && dc.leased && updated)
-			updated(dc.window);
+			drew(dc);
 	};
 	const auto require_dc = [this](const ApiCall &call, size_t index) -> DesktopDC & {
 		auto *dc = objects.dc(call[index]);
@@ -1440,6 +1440,50 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
 				throw uint32_t(87);
 			const auto pixels = source->pixels();
+			if (painter.bitmap.depth == 32) {
+				// The usual case, a surface of 32 bits: the rectangles the clip leaves are blended row by row, straight between the two
+				// surfaces. Windows redraw themselves through this call many times a second.
+				const int64_t left = int64_t(dx) + destination.origin_x, top = int64_t(dy) + destination.origin_y;
+				const int64_t x0 = std::max<int64_t>(left, 0), y0 = std::max<int64_t>(top, 0);
+				const int64_t x1 = std::min<int64_t>(left + dw, painter.bitmap.width), y1 = std::min<int64_t>(top + dh, painter.bitmap.height);
+				const bool per_pixel = format & 1;
+				bool drawn = false;
+				if (x0 < x1 && y0 < y1)
+					for (const auto &area : destination.paintable(x0, y0, x1, y1))
+						for (int64_t device_y = area.top; device_y < area.bottom; ++device_y) {
+							const int64_t source_y = sy + (device_y - top) * sh / dh;
+							if (source_y < 0 || source_y >= source->height)
+								continue;
+							const size_t row = source->top_down ? size_t(source_y) : source->height - 1 - size_t(source_y);
+							const uint8_t *from = &pixels[row * source->width * 4];
+							uint8_t *to = painter.pixel_pointer(area.left, device_y);
+							for (int64_t device_x = area.left; device_x < area.right; ++device_x, to += 4) {
+								const int64_t source_x = sw == dw ? sx + (device_x - left) : sx + (device_x - left) * sw / dw;
+								if (source_x < 0 || source_x >= source->width)
+									continue;
+								const uint8_t *p = from + size_t(source_x) * 4;
+								if (per_pixel) {
+									// Premultiplied source: scaled by the constant alpha, then composed with the pixel's own alpha.
+									const uint32_t keep = 255 - p[3] * constant / 255;
+									to[0] = uint8_t(std::min(p[0] * constant / 255 + to[0] * keep / 255, 255u));
+									to[1] = uint8_t(std::min(p[1] * constant / 255 + to[1] * keep / 255, 255u));
+									to[2] = uint8_t(std::min(p[2] * constant / 255 + to[2] * keep / 255, 255u));
+								} else {
+									to[0] = uint8_t((p[0] * constant + to[0] * (255 - constant)) / 255);
+									to[1] = uint8_t((p[1] * constant + to[1] * (255 - constant)) / 255);
+									to[2] = uint8_t((p[2] * constant + to[2] * (255 - constant)) / 255);
+								}
+								to[3] = 0;
+								drawn = true;
+							}
+						}
+				if (drawn) {
+					painter.mark();
+					touched(destination);
+				}
+				call.ret(1);
+				return;
+			}
 			for (int32_t y = 0; y < dh; ++y)
 				for (int32_t x = 0; x < dw; ++x) {
 					const int64_t device_x = int64_t(dx) + x + destination.origin_x, device_y = int64_t(dy) + y + destination.origin_y;
@@ -1980,47 +2024,65 @@ void NativeDesktop::register_image_api(ApiRegistry &registry)
 			}
 		});
 	});
-	// CreateIcon(instance, width, height, planes, bits per pixel, AND bits, XOR bits): a monochrome mask whose rows are padded to words,
-	// and the color image in the same top-down rows, at 32 bits per pixel or as a second monochrome plane.
+	// An icon or cursor from its planes: a monochrome mask whose rows are padded to words, and the color image in the same top-down rows,
+	// at 32 bits per pixel or as a second monochrome plane.
+	const auto from_planes = [](ApiCall &call, uint32_t width, uint32_t height, uint32_t depth, uint64_t and_address, uint64_t xor_address) {
+		if (!width || !height || width > 1024 || height > 1024 || !and_address || !xor_address || (depth != 1 && depth != 32))
+			throw uint32_t(87);
+		const size_t mask_stride = ((size_t(width) + 15) / 16) * 2;
+		const auto and_bits = call.read(and_address, mask_stride * height);
+		const auto xor_bits = call.read(xor_address, depth == 32 ? size_t(width) * height * 4 : mask_stride * height);
+		DesktopIcon icon{};
+		icon.monochrome = depth == 1;
+		icon.shared = false;
+		auto &image = icon.image;
+		image.color.width = width;
+		image.color.height = height;
+		image.color.rgba.assign(size_t(width) * height * 4, 0);
+		image.and_mask.assign(size_t(width) * height, 0);
+		bool any_alpha = false;
+		for (uint32_t y = 0; y < height; ++y)
+			for (uint32_t x = 0; x < width; ++x) {
+				const bool transparent = (and_bits[y * mask_stride + x / 8] >> (7 - x % 8)) & 1;
+				const size_t at = (size_t(y) * width + x) * 4;
+				if (depth == 32) {
+					const auto *p = &xor_bits[at];
+					image.color.rgba[at] = p[2];
+					image.color.rgba[at + 1] = p[1];
+					image.color.rgba[at + 2] = p[0];
+					image.color.rgba[at + 3] = p[3];
+					any_alpha = any_alpha || p[3];
+				} else {
+					const uint8_t level = ((xor_bits[y * mask_stride + x / 8] >> (7 - x % 8)) & 1) ? 255 : 0;
+					image.color.rgba[at] = image.color.rgba[at + 1] = image.color.rgba[at + 2] = level;
+				}
+				image.and_mask[size_t(y) * width + x] = transparent;
+			}
+		image.has_alpha = any_alpha;
+		if (!any_alpha)
+			for (size_t i = 0; i < image.and_mask.size(); ++i)
+				image.color.rgba[i * 4 + 3] = image.and_mask[i] ? 0 : 255;
+		return icon;
+	};
+	// CreateIcon(instance, width, height, planes, bits per pixel, AND bits, XOR bits).
 	registry.add("CreateIcon", 7, [=, this](ApiCall &call) {
 		guarded(call, 0, [&] {
-			const uint32_t width = call.u32(1), height = call.u32(2), depth = uint32_t(uint8_t(call.u32(3))) * uint32_t(uint8_t(call.u32(4)));
-			if (!width || !height || width > 1024 || height > 1024 || !call[5] || !call[6] || (depth != 1 && depth != 32))
-				throw uint32_t(87);
-			const size_t mask_stride = ((size_t(width) + 15) / 16) * 2;
-			const auto and_bits = call.read(call[5], mask_stride * height);
-			const auto xor_bits = call.read(call[6], depth == 32 ? size_t(width) * height * 4 : mask_stride * height);
-			DesktopIcon icon{};
-			icon.monochrome = depth == 1;
-			icon.shared = false;
-			auto &image = icon.image;
-			image.color.width = width;
-			image.color.height = height;
-			image.color.rgba.assign(size_t(width) * height * 4, 0);
-			image.and_mask.assign(size_t(width) * height, 0);
-			bool any_alpha = false;
-			for (uint32_t y = 0; y < height; ++y)
-				for (uint32_t x = 0; x < width; ++x) {
-					const bool transparent = (and_bits[y * mask_stride + x / 8] >> (7 - x % 8)) & 1;
-					const size_t at = (size_t(y) * width + x) * 4;
-					if (depth == 32) {
-						const auto *p = &xor_bits[at];
-						image.color.rgba[at] = p[2];
-						image.color.rgba[at + 1] = p[1];
-						image.color.rgba[at + 2] = p[0];
-						image.color.rgba[at + 3] = p[3];
-						any_alpha = any_alpha || p[3];
-					} else {
-						const uint8_t level = ((xor_bits[y * mask_stride + x / 8] >> (7 - x % 8)) & 1) ? 255 : 0;
-						image.color.rgba[at] = image.color.rgba[at + 1] = image.color.rgba[at + 2] = level;
-					}
-					image.and_mask[size_t(y) * width + x] = transparent;
-				}
-			image.has_alpha = any_alpha;
-			if (!any_alpha)
-				for (size_t i = 0; i < image.and_mask.size(); ++i)
-					image.color.rgba[i * 4 + 3] = image.and_mask[i] ? 0 : 255;
-			const auto handle = objects.add(std::move(icon));
+			const uint32_t depth = uint32_t(uint8_t(call.u32(3))) * uint32_t(uint8_t(call.u32(4)));
+			const auto handle = objects.add(from_planes(call, call.u32(1), call.u32(2), depth, call[5], call[6]));
+			if (!handle)
+				throw uint32_t(8);
+			call.ret(handle);
+		});
+	});
+	// CreateCursor(instance, hot spot x, hot spot y, width, height, AND bits, XOR bits): a monochrome cursor. A video player makes one with
+	// the AND plane all set and the XOR plane clear, which shows nothing over its picture.
+	registry.add("CreateCursor", 7, [=, this](ApiCall &call) {
+		guarded(call, 0, [&] {
+			auto cursor = from_planes(call, call.u32(3), call.u32(4), 1, call[5], call[6]);
+			cursor.cursor = true;
+			cursor.hotspot_x = call.u32(1);
+			cursor.hotspot_y = call.u32(2);
+			const auto handle = objects.add(std::move(cursor));
 			if (!handle)
 				throw uint32_t(8);
 			call.ret(handle);

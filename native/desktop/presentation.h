@@ -17,7 +17,7 @@ namespace raven {
 // popup_done: the compositor dismissed a popup (for example by a click outside it).
 // pointer_relative: x and y carry the movement of the mouse itself, unaccelerated and not stopped by the screen edges.
 enum class DesktopEventKind { message, pointer_motion, pointer_button, keymap, modifiers, keyboard_focus, key, popup_done, resize, pointer_wheel,
-	pointer_relative };
+	pointer_relative, pointer_leave };
 
 struct DesktopEvent {
 	uint64_t window;
@@ -89,6 +89,12 @@ struct DesktopPresentation {
 	// Keeps a top-level window above the top-level window that owns it, as Windows keeps an owned dialog; 0 for no owner. Given before the
 	// window's first frame.
 	std::function<void(uint64_t handle,uint64_t owner)> transient_for;
+	// Whether the window's pixels carry premultiplied alpha, as those a layered window hands over do: the compositor blends them over
+	// what lies below instead of showing them opaque. Given before the frame.
+	std::function<void(uint64_t handle,bool alpha)> translucent;
+	// Said before a frame is presented: it differs from the window's last one inside this rectangle alone (left, top, right, bottom),
+	// so the rest of it need not be looked at.
+	std::function<void(uint64_t handle,std::array<int32_t,4> area)> changed_within;
 };
 
 }

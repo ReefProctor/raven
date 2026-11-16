@@ -7,6 +7,7 @@
 
 #include <windows.h>
 #include <shobjidl.h>
+#include <commctrl.h>
 
 #define MAX_FILTERS 32
 #define MAX_RESULTS 64
@@ -45,5 +46,15 @@ const WCHAR *file_part(const WCHAR *path);
 void parent_directory(WCHAR *dir);
 BOOL match_spec(const WCHAR *spec, const WCHAR *name);
 
-/* Shows the file dialog for the state, which receives the chosen paths; TRUE when the user accepted. */
+/* Shows the file dialog for the state, which receives the chosen paths; TRUE when the user accepted. The dialog runs in the runtime's
+ * file picker, a trusted program of its own that sees the host's files and grants the chosen ones to this program; show_dialog is the
+ * window itself, which the picker shows, and which the program shows in its own process when the picker cannot start. */
 BOOL run_dialog(HWND owner, DialogState *state);
+BOOL show_dialog(HWND owner, DialogState *state);
+
+/* The pictures of the shell's image lists, by index. */
+enum { ICON_FOLDER, ICON_FILE, ICON_DRIVE, ICON_COMPUTER, ICON_STAR, ICON_COUNT };
+
+HIMAGELIST system_icons(BOOL small);
+/* ExtractIconEx, called from within the component that exports it. */
+UINT shell_icons(LPCWSTR file, int index, HICON *large, HICON *small, UINT count);

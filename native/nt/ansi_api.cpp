@@ -2,6 +2,7 @@
 #include "text.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include <sys/mman.h>
@@ -10,7 +11,23 @@ namespace raven {
 
 namespace {
 
-constexpr uint32_t ansi_code_page = 1252;
+constexpr uint32_t ansi_code_page = 1252, oem_code_page = 437;
+
+// SetFileApisToOEM switches the file functions of the process to the OEM code page, as console programs do; the rest stay in ANSI.
+std::atomic<bool> file_apis_oem{false};
+
+bool file_function(std::string_view name)
+{
+	for (const std::string_view part : {"File", "Directory", "Path", "Drive", "Volume"})
+		if (name.find(part) != name.npos)
+			return true;
+	return false;
+}
+
+uint32_t code_page_of(bool file)
+{
+	return file && file_apis_oem.load(std::memory_order_relaxed) ? oem_code_page : ansi_code_page;
+}
 
 // How one ANSI API maps onto its wide twin: arguments that are zero-terminated input strings, an optional output buffer
 // with the argument holding its capacity in characters, and an argument that receives a pointer into that buffer.
@@ -29,17 +46,25 @@ struct Adapter {
 	bool list = false;
 	// An input list at this argument, in the same form, as WritePrivateProfileSection takes a section's lines.
 	int input_list = -1;
+	// A string argument below 0x10000 is an integer atom (MAKEINTATOM), passed on as it is.
+	bool atoms = false;
 };
 
 const Adapter adapters[] = {
-	{"AddAtomA", {0}},
-	{"FindAtomA", {0}},
+	{"AddAtomA", {0}, -1, -1, -1, -1, -1, 0, false, -1, true},
+	{"FindAtomA", {0}, -1, -1, -1, -1, -1, 0, false, -1, true},
+	{"GlobalAddAtomA", {0}, -1, -1, -1, -1, -1, 0, false, -1, true},
+	{"GlobalFindAtomA", {0}, -1, -1, -1, -1, -1, 0, false, -1, true},
+	{"GetAtomNameA", {}, 1, 2},
+	{"GlobalGetAtomNameA", {}, 1, 2},
 	{"CreateFileA", {0}},
 	{"GetFileAttributesA", {0}},
 	{"SetupDiGetClassDevsA", {1}},
 	{"SetFileAttributesA", {0}},
 	{"DeleteFileA", {0}},
 	{"MoveFileA", {0, 1}},
+	{"MoveFileExA", {0, 1}},
+	{"MoveFileWithProgressA", {0, 1}},
 	{"CopyFileA", {0, 1}},
 	{"CreateDirectoryA", {0}},
 	{"RemoveDirectoryA", {0}},
@@ -62,7 +87,11 @@ const Adapter adapters[] = {
 	{"GetPrivateProfileIntA", {0, 1, 3}},
 	{"WritePrivateProfileStringA", {0, 1, 2, 3}},
 	{"WritePrivateProfileSectionA", {0, 2}, -1, -1, -1, -1, -1, 0, false, 1},
+	// The structure at argument 2 is raw bytes of the caller's giving, the same in both forms, so only the names are text.
+	{"GetPrivateProfileStructA", {0, 1, 4}},
+	{"WritePrivateProfileStructA", {0, 1, 4}},
 	{"GetDriveTypeA", {0}},
+	{"FindActCtxSectionStringA", {3}},
 	{"GetDateFormatA", {3}, 4, 5},
 	{"GetTimeFormatA", {3}, 4, 5},
 	{"GetDiskFreeSpaceA", {0}},
@@ -116,15 +145,16 @@ void register_ansi_adapters(ApiRegistry &registry)
 			continue;
 		const auto [arguments, handler] = *base;
 		registry.add(adapter.name, arguments, [adapter, handler = handler, arguments = arguments](ApiCall &call) {
+			const auto code_page = code_page_of(file_function(adapter.name));
 			Scratch scratch(call.process);
 			std::vector<uint64_t> words;
 			for (size_t index = 0; index < arguments; ++index)
 				words.push_back(call[index]);
 			const bool text_arguments = adapter.flag_argument < 0 || !(uint32_t(words[size_t(adapter.flag_argument)]) & adapter.flag_mask);
 			for (const auto index : adapter.strings) {
-				if (!text_arguments || index >= words.size() || !words[index])
+				if (!text_arguments || index >= words.size() || !words[index] || (adapter.atoms && words[index] < 0x10000))
 					continue;
-				const auto text = from_ansi(call.narrow(words[index]), ansi_code_page);
+				const auto text = from_ansi(call.narrow(words[index]), code_page);
 				const auto at = scratch.block((text.size() + 1) * 2);
 				call.write(at, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(text.c_str()), (text.size() + 1) * 2));
 				words[index] = at;
@@ -135,7 +165,7 @@ void register_ansi_adapters(ApiRegistry &registry)
 					const auto entry = call.narrow(at);
 					if (entry.empty())
 						break;
-					joined += from_ansi(entry, ansi_code_page) + u'\0';
+					joined += from_ansi(entry, code_page) + u'\0';
 					at += entry.size() + 1;
 				}
 				joined.push_back(u'\0');
@@ -171,13 +201,13 @@ void register_ansi_adapters(ApiRegistry &registry)
 				const auto raw = call.read(wide_buffer, (std::min<size_t>(inner.result, capacity - 1) + 1) * 2);
 				std::u16string text(raw.size() / 2, u'\0');
 				std::memcpy(text.data(), raw.data(), text.size() * 2);
-				auto narrow = to_ansi(text, ansi_code_page);
+				auto narrow = to_ansi(text, code_page);
 				narrow.resize(std::min<size_t>(narrow.size(), capacity));
 				call.write(narrow_buffer, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(narrow.data()), narrow.size()));
 				call.ret(inner.result);
 			} else if (wide_buffer && inner.result && inner.result < capacity) {
 				const auto text = call.wide(wide_buffer, capacity);
-				const auto narrow = to_ansi(text, ansi_code_page);
+				const auto narrow = to_ansi(text, code_page);
 				call.put_narrow(narrow_buffer, narrow, capacity);
 				call.ret(narrow.size());
 				if (file_part) {
@@ -186,7 +216,7 @@ void register_ansi_adapters(ApiRegistry &registry)
 					const auto part = call.load_pointer(wide_part);
 					if (part >= wide_buffer && part < wide_buffer + (uint64_t(capacity) + 1) * 2)
 						call.store_pointer(file_part, narrow_buffer +
-							to_ansi(std::u16string_view(text).substr(0, size_t((part - wide_buffer) / 2)), ansi_code_page).size());
+							to_ansi(std::u16string_view(text).substr(0, size_t((part - wide_buffer) / 2)), code_page).size());
 					else
 						call.store_pointer(file_part, 0);
 				}
@@ -196,7 +226,7 @@ void register_ansi_adapters(ApiRegistry &registry)
 				auto record = call.read(find_wide, 44);
 				const auto name = call.wide(find_wide + 44, 260);
 				const auto alternate = call.wide(find_wide + 44 + 520, 14);
-				auto narrow_name = to_ansi(name, ansi_code_page), narrow_alternate = to_ansi(alternate, ansi_code_page);
+				auto narrow_name = to_ansi(name, code_page), narrow_alternate = to_ansi(alternate, code_page);
 				narrow_name.resize(260, '\0');
 				narrow_alternate.resize(14, '\0');
 				record.insert(record.end(), narrow_name.begin(), narrow_name.end());
@@ -206,6 +236,9 @@ void register_ansi_adapters(ApiRegistry &registry)
 		});
 	}
 	register_temp_file_name(registry);
+	registry.add("SetFileApisToOEM", 0, [](ApiCall &call) { file_apis_oem = true; call.ret(0); });
+	registry.add("SetFileApisToANSI", 0, [](ApiCall &call) { file_apis_oem = false; call.ret(0); });
+	registry.add("AreFileApisANSI", 0, [](ApiCall &call) { call.ret(file_apis_oem ? 0 : 1); });
 }
 
 // GetTempFileNameA: the wide twin creates the file; its answer is the unique number, and the name goes back in the program's code page
@@ -217,11 +250,12 @@ void register_temp_file_name(ApiRegistry &registry)
 		return;
 	registry.add("GetTempFileNameA", 4, [handler = base->second](ApiCall &call) {
 		Scratch scratch(call.process);
+		const auto code_page = code_page_of(true);
 		std::vector<uint64_t> words{call[0], call[1], call[2], 0};
 		for (const size_t index : {size_t(0), size_t(1)}) {
 			if (!words[index])
 				continue;
-			const auto text = from_ansi(call.narrow(words[index]), ansi_code_page);
+			const auto text = from_ansi(call.narrow(words[index]), code_page);
 			const auto at = scratch.block((text.size() + 1) * 2);
 			call.write(at, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(text.c_str()), (text.size() + 1) * 2));
 			words[index] = at;
@@ -231,7 +265,7 @@ void register_temp_file_name(ApiRegistry &registry)
 		handler(inner);
 		call.ret(inner.result);
 		if (inner.result && call[3])
-			call.put_narrow(call[3], to_ansi(call.wide(words[3], 260), ansi_code_page), 260);
+			call.put_narrow(call[3], to_ansi(call.wide(words[3], 260), code_page), 260);
 	});
 }
 

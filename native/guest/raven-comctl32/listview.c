@@ -424,7 +424,8 @@ static void view_item(list_state *list, int index, int sub, UINT ask, UINT state
 	view->state &= ~list->callback_mask;
 
 	if (ask & LVIF_TEXT) {
-		const WCHAR *text = !item ? LPSTR_TEXTCALLBACKW : sub == 0 ? item->text : cell ? cell->text : NULL;
+		/* A subitem never set is asked for, as one set to LPSTR_TEXTCALLBACK is: 7-Zip fills its columns only that way. */
+		const WCHAR *text = !item || (sub > 0 && !cell) ? LPSTR_TEXTCALLBACKW : sub == 0 ? item->text : cell->text;
 		if (IS_CALLBACK(text))
 			need |= LVIF_TEXT;
 		else if (text)
@@ -2044,7 +2045,7 @@ static BOOL get_item(list_state *list, LVITEMW *target, BOOL wide)
 		return FALSE;
 	if (target->mask & LVIF_NORECOMPUTE) {
 		if (target->mask & LVIF_TEXT) {
-			const WCHAR *text = list->owner_data ? LPSTR_TEXTCALLBACKW : sub == 0 ? list->items[index]->text : (find_cell(list->items[index], sub) ? find_cell(list->items[index], sub)->text : NULL);
+			const WCHAR *text = list->owner_data ? LPSTR_TEXTCALLBACKW : sub == 0 ? list->items[index]->text : (find_cell(list->items[index], sub) ? find_cell(list->items[index], sub)->text : LPSTR_TEXTCALLBACKW);
 			if (IS_CALLBACK(text)) {
 				target->pszText = LPSTR_TEXTCALLBACKW;
 				return TRUE;
@@ -2659,8 +2660,14 @@ static void draw_item(list_state *list, HDC dc, int index, const RECT *clip, DWO
 		draw.clrTextBk = GetSysColor(COLOR_3DFACE);
 	}
 
-	if (pre_answer & CDRF_NOTIFYITEMDRAW)
+	if (pre_answer & CDRF_NOTIFYITEMDRAW) {
 		answer = (DWORD)custom_draw(list, &draw, CDDS_ITEMPREPAINT);
+		/* The colours a parent gives a selected item do not hide the selection: WinForms hands every row its BackColor. */
+		if (selected && show && !(state & LVIS_DROPHILITED)) {
+			draw.clrText = GetSysColor(focused_window ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT);
+			draw.clrTextBk = GetSysColor(focused_window ? COLOR_HIGHLIGHT : COLOR_3DFACE);
+		}
+	}
 	if (list->dead || (!list->owner_data && index >= list->count))
 		return;
 	if (answer & CDRF_NEWFONT)

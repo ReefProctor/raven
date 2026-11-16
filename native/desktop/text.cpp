@@ -77,7 +77,7 @@ uint64_t NativeDesktop::text_output(std::span<const uint64_t> args)
 	if(args[4] && options){
 		const auto bytes=process.read_memory(args[4],16);std::array<int32_t,4> fields{};
 		for(size_t i=0;i<4;++i){uint32_t value=0;for(size_t b=0;b<4;++b)value|=uint32_t(bytes[i*4+b])<<(b*8);fields[i]=int32_t(value);}
-		rect=DesktopRect{fields[0],fields[1],fields[2],fields[3]};
+		rect=DesktopRect{std::min(fields[0],fields[2]),std::min(fields[1],fields[3]),std::max(fields[0],fields[2]),std::max(fields[1],fields[3])};
 	}
 	if(!count && (!(options & 2) || !rect))return 1;
 	auto *bitmap=objects.bitmap(dc->bitmap);if(!bitmap || bitmap->depth!=32)throw uint32_t(120);
@@ -119,7 +119,7 @@ uint64_t NativeDesktop::text_output(std::span<const uint64_t> args)
 		pixels[at]=uint8_t(color>>16);pixels[at+1]=uint8_t(color>>8);pixels[at+2]=uint8_t(color);pixels[at+3]=0;changed=true;
 	}
 	if(changed){
-		if(dc->window && dc->leased && updated)updated(dc->window);
+		if(dc->window && dc->leased && updated)drew(*dc);
 	}
 	return 1;
 }

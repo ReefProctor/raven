@@ -80,7 +80,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 			threads.block([&context, section] {
 				return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0) ||
 					context.process.read_memory(section + owning_thread, 8) == std::vector<uint8_t>(8, 0);
-			}, std::nullopt);
+			}, std::nullopt, false, true);
 		}
 	});
 	registry.add("TryEnterCriticalSection", 1, [take](ApiCall &call) { call.ret(take(call)); });
@@ -102,14 +102,14 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t lock = call[0];
 		const size_t width = call.pointer_width();
 		while (call.process.compare_exchange(lock, 0, 1, width))
-			threads.block([&context, lock, width] { return context.process.read_memory(lock, width) == std::vector<uint8_t>(width, 0); }, std::nullopt);
+			threads.block([&context, lock, width] { return context.process.read_memory(lock, width) == std::vector<uint8_t>(width, 0); }, std::nullopt, false, true);
 	};
 	const auto acquire_shared = [&context, &threads](ApiCall &call) {
 		const uint64_t lock = call[0];
 		for (;;) {
 			const auto value = call.load_pointer(lock);
 			if (value & 1)
-				threads.block([&context, lock] { return !(context.process.read_memory(lock, 1)[0] & 1); }, std::nullopt);
+				threads.block([&context, lock] { return !(context.process.read_memory(lock, 1)[0] & 1); }, std::nullopt, false, true);
 			else if (call.process.compare_exchange(lock, value, value + 2, call.pointer_width()) == value)
 				return;
 		}
@@ -197,18 +197,23 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 			sub.store<int32_t>(section + lock_count, -1);
 		}, [&] {
 			while (!take(sub))
-				threads.block([&context, section] { return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0); }, std::nullopt);
+				threads.block([&context, section] { return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0); }, std::nullopt, false, true);
 			sub.store<int32_t>(section + recursion_count, saved);
 		}, call.u32(2));
 	});
-	const auto wake = [variables](ApiCall &call, bool all) {
+	const auto wake = [variables, &threads](ApiCall &call, bool all) {
 		auto &list = (*variables)[call[0]];
+		bool woke = false;
 		for (auto &waiter : list)
 			if (!waiter->woken) {
-				waiter->woken = true;
+				waiter->woken = woke = true;
 				if (!all)
 					break;
 			}
+		// The thread woken runs before the waker goes on, as it would on another processor: a renderer's worker answers the thread
+		// that waits for its frame without first waiting for every other thread's turn.
+		if (woke && !call.process.serving())
+			threads.hand_over();
 	};
 	registry.add("WakeConditionVariable", 1, [wake](ApiCall &call) { wake(call, false); });
 	registry.add("WakeAllConditionVariable", 1, [wake](ApiCall &call) { wake(call, true); });
@@ -226,7 +231,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t once = call[0];
 		auto state = call.load_pointer(once);
 		if ((state & 3) == 1 && !(flags & 1)) {
-			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt);
+			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt, false, true);
 			state = call.load_pointer(once);
 		}
 		if ((state & 3) == 2) {
@@ -256,7 +261,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t once = call[0];
 		auto state = call.load_pointer(once);
 		if ((state & 3) == 1) {
-			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt);
+			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt, false, true);
 			state = call.load_pointer(once);
 		}
 		if ((state & 3) == 2) {
@@ -298,15 +303,20 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		std::optional<std::chrono::steady_clock::time_point> wake;
 		if (call.u32(3) != UINT32_MAX)
 			wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(call.u32(3));
-		const bool changed = threads.block([&context, address, size, expected] { return context.process.read_memory(address, size) != expected; }, wake);
+		const bool changed = threads.block([&context, address, size, expected] { return context.process.read_memory(address, size) != expected; }, wake, false, true);
 		if (!changed) {
 			call.fail(1460);
 			return;
 		}
 		call.ret(1);
 	});
-	registry.add("WakeByAddressSingle", 1, [](ApiCall &) {});
-	registry.add("WakeByAddressAll", 1, [](ApiCall &) {});
+	// A thread whose address changed meanwhile runs before the waker goes on, as for a condition variable.
+	const auto wake_address = [&threads](ApiCall &call) {
+		if (!call.process.serving())
+			threads.hand_over();
+	};
+	registry.add("WakeByAddressSingle", 1, wake_address);
+	registry.add("WakeByAddressAll", 1, wake_address);
 
 	// An NT timeout: none waits for ever, a negative one is relative and a positive one absolute, both in 100 ns units.
 	const auto nt_timeout = [](ApiCall &call, uint64_t address) -> std::optional<std::chrono::steady_clock::time_point> {
@@ -333,11 +343,11 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t address = call[0];
 		const auto expected = call.read(call[1], size);
 		const bool changed = threads.block([&context, address, size, expected] { return context.process.read_memory(address, size) != expected; },
-			nt_timeout(call, call[3]));
+			nt_timeout(call, call[3]), false, true);
 		call.ret(changed ? 0 : 0x102);
 	});
-	registry.add("RtlWakeAddressSingle", 1, [](ApiCall &) {});
-	registry.add("RtlWakeAddressAll", 1, [](ApiCall &) {});
+	registry.add("RtlWakeAddressSingle", 1, wake_address);
+	registry.add("RtlWakeAddressAll", 1, wake_address);
 
 	// Keyed events: a release meets one wait on the same key, whichever comes first waiting for the other. A null handle names the
 	// process-wide keyed event that critical sections and slim locks use; a key is an address within the event it is used on.
