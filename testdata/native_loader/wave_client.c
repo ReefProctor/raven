@@ -57,6 +57,21 @@ static void CALLBACK on_slow(UINT id, UINT message, DWORD_PTR instance, DWORD_PT
 	InterlockedExchange(&slow_finished, 1);
 }
 
+static volatile LONG late_ticks;
+static volatile DWORD late_times[4];
+
+static void CALLBACK on_late_tick(UINT id, UINT message, DWORD_PTR instance, DWORD_PTR first, DWORD_PTR second)
+{
+	const LONG count = InterlockedIncrement(&late_ticks);
+	if (count <= 4)
+		late_times[count - 1] = timeGetTime();
+}
+
+static void CALLBACK on_stall(UINT id, UINT message, DWORD_PTR instance, DWORD_PTR first, DWORD_PTR second)
+{
+	Sleep(130);
+}
+
 static int timers(void)
 {
 	const MMRESULT periodic = timeSetEvent(5, 1, on_tick, 0, TIME_PERIODIC);
@@ -82,6 +97,14 @@ static int timers(void)
 	if (timeKillEvent(slow) != TIMERR_NOERROR) return 10;
 	if (!slow_finished) return 11;
 	if (timeKillEvent(slow) != MMSYSERR_INVALPARAM) return 12;
+	/* A periodic timer the timer thread reached more than a period late is called once, then a period later. */
+	if (!timeSetEvent(1, 1, on_stall, 0, TIME_ONESHOT)) return 13;
+	const MMRESULT late = timeSetEvent(40, 1, on_late_tick, 0, TIME_PERIODIC);
+	if (!late) return 14;
+	for (int waited = 0; late_ticks < 2 && waited < 400; waited++)
+		Sleep(5);
+	if (timeKillEvent(late) != TIMERR_NOERROR || late_ticks < 2) return 15;
+	if (late_times[1] - late_times[0] < 10) return 16;
 	return 0;
 }
 
@@ -166,6 +189,31 @@ static int function_callback(void)
 	return 0;
 }
 
+static volatile LONG self_close_result = -1, self_closed;
+
+static void CALLBACK on_self_close(HWAVEOUT device, UINT message, DWORD_PTR instance, DWORD_PTR first, DWORD_PTR second)
+{
+	if (message == WOM_DONE)
+		InterlockedExchange(&self_close_result, (LONG)waveOutClose(device));
+	else if (message == WOM_CLOSE)
+		InterlockedExchange(&self_closed, 1);
+}
+
+/* A device closed from the callback that hands back its last buffer closes, and its thread ends. */
+static int close_in_callback(void)
+{
+	const WAVEFORMATEX format = format_8k();
+	HWAVEOUT device;
+	if (waveOutOpen(&device, WAVE_MAPPER, &format, (DWORD_PTR)on_self_close, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) return 112;
+	static WAVEHDR header;
+	if (prepare(device, &header, 80, 0, 0) || waveOutWrite(device, &header, sizeof header)) return 113;
+	for (int waited = 0; !self_closed && waited < 2000; waited++)
+		Sleep(1);
+	if (self_close_result != MMSYSERR_NOERROR || !self_closed) return 114;
+	if (waveOutClose(device) != MMSYSERR_INVALHANDLE) return 115;
+	return 0;
+}
+
 /* A message for the device, taken from the thread's queue within a second. */
 static int expect_message(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
@@ -227,8 +275,13 @@ static int loops(void)
 	if (endless.dwFlags & WHDR_DONE) return 46;
 	if (waveOutBreakLoop(device) != MMSYSERR_NOERROR) return 47;
 	if (wait_done(&endless.dwFlags, 1000)) return 48;
+	/* A loop with no frame in it has nothing to repeat and comes back at once. */
+	WAVEHDR empty;
+	if (prepare(device, &empty, 0, WHDR_BEGINLOOP | WHDR_ENDLOOP, 0xffffffff) || waveOutWrite(device, &empty, sizeof empty)) return 110;
+	if (wait_done(&empty.dwFlags, 1000)) return 111;
 	waveOutUnprepareHeader(device, &looped, sizeof looped);
 	waveOutUnprepareHeader(device, &endless, sizeof endless);
+	waveOutUnprepareHeader(device, &empty, sizeof empty);
 	if (waveOutClose(device) != MMSYSERR_NOERROR) return 49;
 	CloseHandle(event);
 	return 0;
@@ -239,16 +292,16 @@ static int reset_paused(void)
 	const WAVEFORMATEX format = format_8k();
 	HWAVEOUT device;
 	if (waveOutOpen(&device, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
-		return 70;
+		return 120;
 	WAVEHDR header;
 	if (prepare(device, &header, 80, 0, 0))
-		return 71;
+		return 121;
 	if (waveOutPause(device) != MMSYSERR_NOERROR || waveOutReset(device) != MMSYSERR_NOERROR)
-		return 72;
+		return 122;
 	if (waveOutWrite(device, &header, sizeof header) != MMSYSERR_NOERROR || wait_done(&header.dwFlags, 500))
-		return 73;
+		return 123;
 	if (waveOutUnprepareHeader(device, &header, sizeof header) || waveOutClose(device))
-		return 74;
+		return 124;
 	return 0;
 }
 
@@ -270,7 +323,7 @@ static int reset_batch_flags(void)
 	const WAVEFORMATEX format = format_8k();
 	HWAVEOUT device;
 	if (waveOutOpen(&device, WAVE_MAPPER, &format, (DWORD_PTR)on_reset_batch, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR)
-		return 75;
+		return 125;
 	static short long_samples[2][8000];
 	WAVEHDR headers[2] = {0};
 	reset_batch[0] = &headers[0];
@@ -282,15 +335,15 @@ static int reset_batch_flags(void)
 		headers[index].dwBufferLength = sizeof long_samples[index];
 		if (waveOutPrepareHeader(device, &headers[index], sizeof headers[index]) ||
 			waveOutWrite(device, &headers[index], sizeof headers[index]))
-			return 76;
+			return 126;
 	}
 	if (waveOutReset(device) != MMSYSERR_NOERROR || reset_done != 2 || !reset_flags_valid)
-		return 77;
+		return 127;
 	for (int index = 0; index < 2; index++)
 		if (waveOutUnprepareHeader(device, &headers[index], sizeof headers[index]))
-			return 78;
+			return 128;
 	if (waveOutClose(device))
-		return 79;
+		return 129;
 	return 0;
 }
 
@@ -466,6 +519,8 @@ int raven_entry(void)
 	int failed = timers();
 	if (!failed)
 		failed = function_callback();
+	if (!failed)
+		failed = close_in_callback();
 	if (!failed)
 		failed = message_callback(FALSE);
 	if (!failed)

@@ -8,24 +8,14 @@
 CRITICAL_SECTION audio_lock;
 
 /* The endpoints' own GUIDs, which their ids and PKEY_AudioEndpoint_GUID carry. */
-static const GUID render_guid = {0x5a1d0e01, 0x7a3c, 0x4b8e, {0x9a, 0x52, 0x52, 0x41, 0x56, 0x45, 0x4e, 0x01}};
-static const GUID capture_guid = {0x5a1d0e02, 0x7a3c, 0x4b8e, {0x9a, 0x52, 0x52, 0x41, 0x56, 0x45, 0x4e, 0x02}};
 #define RENDER_GUID_TEXT L"{5A1D0E01-7A3C-4B8E-9A52-524156454E01}"
 #define CAPTURE_GUID_TEXT L"{5A1D0E02-7A3C-4B8E-9A52-524156454E02}"
 
 int same_guid(const GUID *left, const GUID *right) { return !memcmp(left, right, sizeof(GUID)); }
 
-static size_t text_length(const WCHAR *text)
-{
-	size_t length = 0;
-	while (text[length])
-		length++;
-	return length;
-}
-
 WCHAR *copy_string(const WCHAR *text)
 {
-	const size_t size = (text_length(text) + 1) * sizeof(WCHAR);
+	const size_t size = ((size_t)lstrlenW(text) + 1) * sizeof(WCHAR);
 	WCHAR *copy = CoTaskMemAlloc(size);
 	if (copy)
 		memcpy(copy, text, size);
@@ -91,29 +81,6 @@ WAVEFORMATEX *mix_format(void)
 	if (format)
 		fill_mix_format(format);
 	return (WAVEFORMATEX *)format;
-}
-
-BOOL format_valid(const WAVEFORMATEX *format)
-{
-	WORD tag = format->wFormatTag;
-	if (tag == WAVE_FORMAT_EXTENSIBLE) {
-		const WAVEFORMATEXTENSIBLE *extensible = (const WAVEFORMATEXTENSIBLE *)format;
-		if (format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) ||
-			extensible->Samples.wValidBitsPerSample > format->wBitsPerSample)
-			return FALSE;
-		if (same_guid(&extensible->SubFormat, &subtype_pcm))
-			tag = WAVE_FORMAT_PCM;
-		else if (same_guid(&extensible->SubFormat, &subtype_float))
-			tag = WAVE_FORMAT_IEEE_FLOAT;
-		else
-			return FALSE;
-	}
-	if (!format->nChannels || format->nChannels > MAX_CHANNELS || format->nSamplesPerSec < 1000 || format->nSamplesPerSec > 384000 ||
-		format->nBlockAlign != format->nChannels * (format->wBitsPerSample / 8))
-		return FALSE;
-	if (tag == WAVE_FORMAT_PCM)
-		return format->wBitsPerSample == 8 || format->wBitsPerSample == 16 || format->wBitsPerSample == 24 || format->wBitsPerSample == 32;
-	return tag == WAVE_FORMAT_IEEE_FLOAT && format->wBitsPerSample == 32;
 }
 
 /* The natural logarithm and the exponential, for the decibels of the volume objects: this component links against no runtime. */
@@ -410,8 +377,8 @@ static HRESULT WINAPI endpoint_GetDataFlow(IMMEndpoint *iface, EDataFlow *flow)
 static const IMMEndpointVtbl endpoint_vtbl = {endpoint_QueryInterface, endpoint_AddRef, endpoint_Release, endpoint_GetDataFlow};
 
 static device devices[2] = {
-	{.flow = eRender, .id = L"{0.0.0.00000000}." RENDER_GUID_TEXT, .name = L"Speakers (Raven Audio)", .guid = &render_guid},
-	{.flow = eCapture, .id = L"{0.0.1.00000000}." CAPTURE_GUID_TEXT, .name = L"Microphone (Raven Audio)", .guid = &capture_guid},
+	{.flow = eRender, .id = L"{0.0.0.00000000}." RENDER_GUID_TEXT, .name = L"Speakers (Raven Audio)"},
+	{.flow = eCapture, .id = L"{0.0.1.00000000}." CAPTURE_GUID_TEXT, .name = L"Microphone (Raven Audio)"},
 };
 
 device *device_of(EDataFlow flow) { return &devices[flow == eRender ? 0 : 1]; }

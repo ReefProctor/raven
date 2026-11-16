@@ -11,8 +11,10 @@ bool EventPulses::pulse(uint64_t handle)
 	const auto event = context.objects.object_as<EventObject>(handle);
 	if (!event)
 		return false;
-	event->pulse_host_waiters();
+	bool used = event->pulse_host_waiters();
 	for (const auto id : context.threads.thread_ids()) {
+		if (used)
+			break;
 		const auto thread = context.threads.find(id);
 		// A thread whose wait holds already is released by something else.
 		if (!thread || thread->state != GuestThread::State::waiting || !thread->ready || thread->ready())
@@ -23,9 +25,11 @@ bool EventPulses::pulse(uint64_t handle)
 			continue;
 		}
 		pulses.push_back({event, thread, thread->waiting_since});
-		if (!event->manual_reset())
-			break;
+		used = !event->manual_reset();
 	}
+	if (!used)
+		event->pulse_other_processes();
+	event->set_state(false);
 	return true;
 }
 
@@ -39,7 +43,7 @@ void EventPulses::settle()
 	});
 }
 
-std::shared_ptr<EventPulses> register_pulse_event(ApiRegistry &registry, KernelContext &context)
+void register_pulse_event(ApiRegistry &registry, KernelContext &context)
 {
 	auto pulses = std::make_shared<EventPulses>(context);
 	context.threads.add_service([pulses] { pulses->settle(); });
@@ -51,7 +55,6 @@ std::shared_ptr<EventPulses> register_pulse_event(ApiRegistry &registry, KernelC
 		else
 			call.fail(6, 0);
 	});
-	return pulses;
 }
 
 }

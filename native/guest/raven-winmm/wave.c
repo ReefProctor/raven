@@ -7,11 +7,7 @@
  */
 #include "winmm_private.h"
 
-#define WAVE_OUT_MAGIC 0x54554f57u
-#define WAVE_IN_MAGIC 0x204e4957u
-
 typedef struct wave {
-	DWORD magic;
 	struct wave *next;
 	BOOL capture;
 	CRITICAL_SECTION lock;
@@ -29,6 +25,8 @@ typedef struct wave {
 	 * bits of the stream frame it ends at. */
 	WAVEHDR *feed, *loop_start;
 	DWORD feed_offset, loops_left;
+	/* The stream frame the loop's pass under way started at. */
+	UINT64 loop_from;
 	BOOL started, paused, closing, closed_by_worker;
 	/* The handle's volume as waveOutSetVolume takes it: the left channel in the low word. */
 	DWORD volume;
@@ -41,48 +39,36 @@ static DWORD device_volume = 0xffffffff;
 
 void wave_init(void) { InitializeCriticalSection(&wave_lock); }
 
+/* The open device of a handle, with its lock held: a close waits for that lock before the device is freed. */
 static wave *wave_of(void *handle, BOOL capture)
 {
 	wave *found = NULL;
 	EnterCriticalSection(&wave_lock);
-	for (wave *each = waves; each; each = each->next)
-		if ((void *)each == handle && each->capture == capture && !each->closing)
+	for (wave *each = waves; each && !found; each = each->next)
+		if ((void *)each == handle && each->capture == capture)
 			found = each;
+	if (found) {
+		EnterCriticalSection(&found->lock);
+		if (found->closing) {
+			LeaveCriticalSection(&found->lock);
+			found = NULL;
+		}
+	}
 	LeaveCriticalSection(&wave_lock);
 	return found;
 }
 
-static BOOL device_id_valid(UINT_PTR id) { return id == 0 || id == WAVE_MAPPER || id == (UINT_PTR)(UINT)WAVE_MAPPER; }
-
-/* What the engine plays: integer PCM of 8, 16, 24 or 32 bits or 32-bit float, plain or extensible, 1 to 8 channels, whole frames. */
-static BOOL format_valid(const WAVEFORMATEX *format)
+static BOOL wave_known(void *handle, BOOL capture)
 {
-	static const GUID subtype_base = {0x00000000, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
-	WORD tag = format->wFormatTag;
-	if (tag == WAVE_FORMAT_EXTENSIBLE) {
-		if (format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
-			return FALSE;
-		const WAVEFORMATEXTENSIBLE *extensible = (const WAVEFORMATEXTENSIBLE *)format;
-		GUID sub = extensible->SubFormat;
-		const DWORD data1 = sub.Data1;
-		sub.Data1 = 0;
-		if (memcmp(&sub, &subtype_base, sizeof sub) || (data1 != WAVE_FORMAT_PCM && data1 != WAVE_FORMAT_IEEE_FLOAT))
-			return FALSE;
-		if (extensible->Samples.wValidBitsPerSample > format->wBitsPerSample)
-			return FALSE;
-		tag = (WORD)data1;
-	}
-	const WORD bits = format->wBitsPerSample;
-	if (tag == WAVE_FORMAT_PCM) {
-		if (bits != 8 && bits != 16 && bits != 24 && bits != 32)
-			return FALSE;
-	} else if (tag != WAVE_FORMAT_IEEE_FLOAT || bits != 32) {
-		return FALSE;
-	}
-	return format->nChannels >= 1 && format->nChannels <= 8 && format->nSamplesPerSec >= 1000 && format->nSamplesPerSec <= 384000 &&
-		format->nBlockAlign == format->nChannels * bits / 8;
+	wave *wave = wave_of(handle, capture);
+	if (wave)
+		LeaveCriticalSection(&wave->lock);
+	return wave != NULL;
 }
 
+static BOOL device_id_valid(UINT_PTR id) { return id == 0 || id == WAVE_MAPPER || id == (UINT_PTR)(UINT)WAVE_MAPPER; }
+
+/* shortcut: the louder channel scales both, a stream has one gain; split it when the engine takes a gain per channel. */
 static void apply_volume(wave *wave)
 {
 	if (wave->capture)
@@ -133,6 +119,7 @@ static void render_feed(wave *wave)
 		if (!wave->feed_offset && (header->dwFlags & WHDR_BEGINLOOP) && wave->loop_start != header) {
 			wave->loop_start = header;
 			wave->loops_left = header->dwLoops ? header->dwLoops - 1 : 0;
+			wave->loop_from = written;
 		}
 		const DWORD length = header->dwBufferLength / wave->frame_bytes * wave->frame_bytes;
 		if (wave->feed_offset < length) {
@@ -149,10 +136,12 @@ static void render_feed(wave *wave)
 		}
 		header->reserved = (DWORD)written;
 		if ((header->dwFlags & WHDR_ENDLOOP) && wave->loop_start) {
-			if (wave->loops_left) {
+			/* A pass with no frame in it would repeat here without ever filling the ring. */
+			if (wave->loops_left && written != wave->loop_from) {
 				wave->loops_left--;
 				wave->feed = wave->loop_start;
 				wave->feed_offset = 0;
+				wave->loop_from = written;
 				continue;
 			}
 			wave->loop_start = NULL;
@@ -161,10 +150,8 @@ static void render_feed(wave *wave)
 		wave->feed_offset = 0;
 	}
 	store64(&shared->write_frames, written);
-	if (!wave->started && !wave->paused && written > load64(&shared->position_frames)) {
-		RavenAudioStart(wave->stream);
-		wave->started = TRUE;
-	}
+	if (!wave->started && !wave->paused && written > load64(&shared->position_frames))
+		wave->started = RavenAudioStart(wave->stream);
 }
 
 /* Takes off the queue the buffers the device has played, and stops the stream once everything written has been. Returns them linked
@@ -227,13 +214,14 @@ static WAVEHDR *capture_step(wave *wave)
 	return done;
 }
 
-static void hand_back(wave *wave, WAVEHDR *done)
+/* Called without the device's lock, and with a copy of its notify where a callback may close the device. */
+static void hand_back(const notify *notify, HANDLE handle, BOOL capture, WAVEHDR *done)
 {
-	const UINT message = wave->capture ? WIM_DATA : WOM_DONE;
+	const UINT message = capture ? WIM_DATA : WOM_DONE;
 	while (done) {
 		WAVEHDR *next = done->lpNext;
 		done->lpNext = NULL;
-		notify_send(&wave->notify, (HANDLE)wave, message, (DWORD_PTR)done, 0);
+		notify_send(notify, handle, message, (DWORD_PTR)done, 0);
 		done = next;
 	}
 }
@@ -244,7 +232,6 @@ static void wave_free(wave *wave)
 	CloseHandle(wave->period);
 	CloseHandle(wave->wake);
 	DeleteCriticalSection(&wave->lock);
-	wave->magic = 0;
 	FREE(wave);
 }
 
@@ -266,7 +253,7 @@ static DWORD WINAPI wave_main(void *parameter)
 		WAVEHDR *done = wave->capture ? (wave->started ? capture_step(wave) : NULL) : render_step(wave);
 		const BOOL active = wave->started;
 		LeaveCriticalSection(&wave->lock);
-		hand_back(wave, done);
+		hand_back(&wave->notify, (HANDLE)wave, wave->capture, done);
 		WaitForMultipleObjects(2, events, FALSE, active ? 100 : INFINITE);
 	}
 }
@@ -274,7 +261,7 @@ static DWORD WINAPI wave_main(void *parameter)
 static MMRESULT wave_open(void **out, UINT id, const WAVEFORMATEX *format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags,
 	BOOL capture)
 {
-	if (!device_id_valid(id) && !(flags & WAVE_MAPPED && id == 0))
+	if (!device_id_valid(id))
 		return MMSYSERR_BADDEVICEID;
 	if (!format)
 		return MMSYSERR_INVALPARAM;
@@ -291,7 +278,6 @@ static MMRESULT wave_open(void **out, UINT id, const WAVEFORMATEX *format, DWORD
 	wave *made = ALLOC(sizeof *made);
 	if (!made)
 		return MMSYSERR_NOMEM;
-	made->magic = capture ? WAVE_IN_MAGIC : WAVE_OUT_MAGIC;
 	made->capture = capture;
 	made->notify = notify;
 	/* Only the plain header is kept: an extensible format reaches the engine as the program gave it. */
@@ -300,7 +286,8 @@ static MMRESULT wave_open(void **out, UINT id, const WAVEFORMATEX *format, DWORD
 	InitializeCriticalSection(&made->lock);
 	made->period = CreateEventW(NULL, FALSE, FALSE, NULL);
 	made->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-	if (made->period && made->wake)
+	const BOOL events = made->period && made->wake;
+	if (events)
 		made->stream = RavenAudioOpen(format, capture ? RAVEN_AUDIO_CAPTURE : 0, 0, 0, made->period, &made->shared);
 	if (!made->stream) {
 		if (made->period)
@@ -309,7 +296,7 @@ static MMRESULT wave_open(void **out, UINT id, const WAVEFORMATEX *format, DWORD
 			CloseHandle(made->wake);
 		DeleteCriticalSection(&made->lock);
 		FREE(made);
-		return MMSYSERR_ALLOCATED;
+		return events ? MMSYSERR_ERROR : MMSYSERR_NOMEM;
 	}
 	made->ring = (BYTE *)made->shared + RAVEN_AUDIO_DATA_OFFSET;
 	made->buffer_frames = made->shared->buffer_frames;
@@ -335,7 +322,6 @@ static MMRESULT wave_close(void *handle, BOOL capture)
 	wave *wave = wave_of(handle, capture);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	if (wave->first) {
 		LeaveCriticalSection(&wave->lock);
 		return WAVERR_STILLPLAYING;
@@ -348,6 +334,7 @@ static MMRESULT wave_close(void *handle, BOOL capture)
 	/* Closed from a callback, the device's own thread frees it once the callback returns. */
 	const BOOL on_worker = GetCurrentThreadId() == wave->thread_id;
 	wave->closed_by_worker = on_worker;
+	SetEvent(wave->wake);
 	LeaveCriticalSection(&wave->lock);
 	EnterCriticalSection(&wave_lock);
 	for (struct wave **link = &waves; *link; link = &(*link)->next)
@@ -358,7 +345,6 @@ static MMRESULT wave_close(void *handle, BOOL capture)
 	LeaveCriticalSection(&wave_lock);
 	const struct notify notify = wave->notify;
 	if (!on_worker) {
-		SetEvent(wave->wake);
 		WaitForSingleObject(wave->thread, INFINITE);
 		CloseHandle(wave->thread);
 		wave_free(wave);
@@ -367,38 +353,32 @@ static MMRESULT wave_close(void *handle, BOOL capture)
 	return MMSYSERR_NOERROR;
 }
 
+/* MMSYSERR_NOERROR leaves the device's lock held. */
 static MMRESULT header_check(void *handle, WAVEHDR *header, UINT size, BOOL capture, wave **out)
 {
-	if (!(*out = wave_of(handle, capture)))
-		return MMSYSERR_INVALHANDLE;
 	if (!header || size < sizeof(WAVEHDR))
-		return MMSYSERR_INVALPARAM;
-	return MMSYSERR_NOERROR;
+		return wave_known(handle, capture) ? MMSYSERR_INVALPARAM : MMSYSERR_INVALHANDLE;
+	return (*out = wave_of(handle, capture)) ? MMSYSERR_NOERROR : MMSYSERR_INVALHANDLE;
 }
 
-static MMRESULT prepare(void *handle, WAVEHDR *header, UINT size, BOOL capture)
+static MMRESULT set_prepared(void *handle, WAVEHDR *header, UINT size, BOOL capture, BOOL prepared)
 {
 	wave *wave;
-	const MMRESULT checked = header_check(handle, header, size, capture, &wave);
-	if (checked)
-		return checked;
+	MMRESULT result = header_check(handle, header, size, capture, &wave);
+	if (result)
+		return result;
 	if (header->dwFlags & WHDR_INQUEUE)
-		return WAVERR_STILLPLAYING;
-	header->dwFlags |= WHDR_PREPARED;
-	return MMSYSERR_NOERROR;
+		result = WAVERR_STILLPLAYING;
+	else if (prepared)
+		header->dwFlags |= WHDR_PREPARED;
+	else
+		header->dwFlags &= ~WHDR_PREPARED;
+	LeaveCriticalSection(&wave->lock);
+	return result;
 }
 
-static MMRESULT unprepare(void *handle, WAVEHDR *header, UINT size, BOOL capture)
-{
-	wave *wave;
-	const MMRESULT checked = header_check(handle, header, size, capture, &wave);
-	if (checked)
-		return checked;
-	if (header->dwFlags & WHDR_INQUEUE)
-		return WAVERR_STILLPLAYING;
-	header->dwFlags &= ~WHDR_PREPARED;
-	return MMSYSERR_NOERROR;
-}
+static MMRESULT prepare(void *handle, WAVEHDR *header, UINT size, BOOL capture) { return set_prepared(handle, header, size, capture, TRUE); }
+static MMRESULT unprepare(void *handle, WAVEHDR *header, UINT size, BOOL capture) { return set_prepared(handle, header, size, capture, FALSE); }
 
 static MMRESULT enqueue(void *handle, WAVEHDR *header, UINT size, BOOL capture)
 {
@@ -406,11 +386,10 @@ static MMRESULT enqueue(void *handle, WAVEHDR *header, UINT size, BOOL capture)
 	const MMRESULT checked = header_check(handle, header, size, capture, &wave);
 	if (checked)
 		return checked;
-	if (!(header->dwFlags & WHDR_PREPARED))
-		return WAVERR_UNPREPARED;
-	if (header->dwFlags & WHDR_INQUEUE)
-		return WAVERR_STILLPLAYING;
-	EnterCriticalSection(&wave->lock);
+	if ((header->dwFlags & (WHDR_PREPARED | WHDR_INQUEUE)) != WHDR_PREPARED) {
+		LeaveCriticalSection(&wave->lock);
+		return header->dwFlags & WHDR_PREPARED ? WAVERR_STILLPLAYING : WAVERR_UNPREPARED;
+	}
 	header->dwFlags = (header->dwFlags & ~WHDR_DONE) | WHDR_INQUEUE;
 	header->lpNext = NULL;
 	header->reserved = 0;
@@ -426,8 +405,8 @@ static MMRESULT enqueue(void *handle, WAVEHDR *header, UINT size, BOOL capture)
 			wave->feed = header;
 		render_feed(wave);
 	}
-	LeaveCriticalSection(&wave->lock);
 	SetEvent(wave->wake);
+	LeaveCriticalSection(&wave->lock);
 	return MMSYSERR_NOERROR;
 }
 
@@ -437,7 +416,6 @@ static MMRESULT reset(void *handle, BOOL capture)
 	wave *wave = wave_of(handle, capture);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	WAVEHDR *done = NULL;
 	if (capture && wave->started)
 		done = capture_step(wave);
@@ -453,8 +431,9 @@ static MMRESULT reset(void *handle, BOOL capture)
 	*tail = wave->first;
 	wave->first = wave->last = wave->feed = wave->loop_start = NULL;
 	wave->feed_offset = wave->loops_left = 0;
+	const notify notify = wave->notify;
 	LeaveCriticalSection(&wave->lock);
-	hand_back(wave, done);
+	hand_back(&notify, (HANDLE)handle, capture, done);
 	return MMSYSERR_NOERROR;
 }
 
@@ -463,8 +442,10 @@ static MMRESULT get_position(void *handle, MMTIME *time, UINT size, BOOL capture
 	wave *wave = wave_of(handle, capture);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	if (!time || size < sizeof(MMTIME))
+	if (!time || size < sizeof(MMTIME)) {
+		LeaveCriticalSection(&wave->lock);
 		return MMSYSERR_INVALPARAM;
+	}
 	const UINT64 frames = load64(&wave->shared->position_frames);
 	switch (time->wType) {
 	case TIME_SAMPLES:
@@ -478,6 +459,7 @@ static MMRESULT get_position(void *handle, MMTIME *time, UINT size, BOOL capture
 		time->u.cb = (DWORD)(frames * wave->format.nBlockAlign);
 		break;
 	}
+	LeaveCriticalSection(&wave->lock);
 	return MMSYSERR_NOERROR;
 }
 
@@ -508,10 +490,7 @@ static MMRESULT error_text(MMRESULT error, WCHAR *text, UINT size)
 		return MMSYSERR_INVALPARAM;
 	for (size_t index = 0; index < sizeof texts / sizeof *texts; index++)
 		if (texts[index].error == error) {
-			size_t length = 0;
-			for (; length + 1 < size && texts[index].text[length]; length++)
-				text[length] = texts[index].text[length];
-			text[length] = 0;
+			lstrcpynW(text, texts[index].text, (int)size);
 			return MMSYSERR_NOERROR;
 		}
 	return MMSYSERR_BADERRNUM;
@@ -530,7 +509,7 @@ static MMRESULT error_text_ascii(MMRESULT error, char *text, UINT size)
 
 static MMRESULT message(UINT_PTR handle, UINT message, DWORD_PTR first, DWORD_PTR second, BOOL capture)
 {
-	if (!device_id_valid(handle) && !wave_of((void *)handle, capture))
+	if (!device_id_valid(handle) && !wave_known((void *)handle, capture))
 		return MMSYSERR_INVALHANDLE;
 	switch (message) {
 	/* The preferred device is the only one, and not only for the console's voice. */
@@ -556,17 +535,15 @@ static void output_caps(UINT_PTR id, WAVEOUTCAPSW *caps)
 	caps->wMid = MM_MICROSOFT;
 	caps->wPid = id == 0 ? MM_MSFT_WSS_WAVEOUT : MM_WAVE_MAPPER;
 	caps->vDriverVersion = 0x0500;
-	const WCHAR *name = id == 0 ? L"Speakers (Raven Audio)" : L"Microsoft Sound Mapper";
-	for (size_t index = 0; name[index]; index++)
-		caps->szPname[index] = name[index];
+	lstrcpynW(caps->szPname, id == 0 ? L"Speakers (Raven Audio)" : L"Microsoft Sound Mapper", MAXPNAMELEN);
 	caps->dwFormats = 0x000fffff;
 	caps->wChannels = 2;
-	caps->dwSupport = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME | WAVECAPS_SAMPLEACCURATE;
+	caps->dwSupport = WAVECAPS_VOLUME | WAVECAPS_SAMPLEACCURATE;
 }
 
 static MMRESULT output_id(UINT_PTR id, UINT_PTR *device)
 {
-	if (wave_of((void *)id, FALSE)) {
+	if (wave_known((void *)id, FALSE)) {
 		*device = 0;
 		return MMSYSERR_NOERROR;
 	}
@@ -624,13 +601,12 @@ EXPORT MMRESULT WINAPI waveOutUnprepareHeader(HWAVEOUT handle, LPWAVEHDR header,
 EXPORT MMRESULT WINAPI waveOutWrite(HWAVEOUT handle, LPWAVEHDR header, UINT size) { return enqueue(handle, header, size, FALSE); }
 EXPORT MMRESULT WINAPI waveOutReset(HWAVEOUT handle) { return reset(handle, FALSE); }
 
-/* Pausing holds the position; a device paused stays paused across a reset and through new buffers until it is restarted. */
+/* Pausing holds the position; new buffers queue without playing until the device is restarted or reset. */
 EXPORT MMRESULT WINAPI waveOutPause(HWAVEOUT handle)
 {
 	wave *wave = wave_of(handle, FALSE);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	if (wave->started)
 		RavenAudioStop(wave->stream);
 	wave->started = FALSE;
@@ -644,11 +620,10 @@ EXPORT MMRESULT WINAPI waveOutRestart(HWAVEOUT handle)
 	wave *wave = wave_of(handle, FALSE);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	wave->paused = FALSE;
 	render_feed(wave);
-	LeaveCriticalSection(&wave->lock);
 	SetEvent(wave->wake);
+	LeaveCriticalSection(&wave->lock);
 	return MMSYSERR_NOERROR;
 }
 
@@ -658,7 +633,6 @@ EXPORT MMRESULT WINAPI waveOutBreakLoop(HWAVEOUT handle)
 	wave *wave = wave_of(handle, FALSE);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	wave->loops_left = 0;
 	LeaveCriticalSection(&wave->lock);
 	return MMSYSERR_NOERROR;
@@ -671,10 +645,11 @@ EXPORT MMRESULT WINAPI waveOutGetVolume(HWAVEOUT handle, LPDWORD volume)
 	wave *wave = wave_of(handle, FALSE);
 	if (!wave && !device_id_valid((UINT_PTR)handle))
 		return MMSYSERR_INVALHANDLE;
-	if (!volume)
-		return MMSYSERR_INVALPARAM;
-	*volume = wave ? wave->volume : device_volume;
-	return MMSYSERR_NOERROR;
+	if (volume)
+		*volume = wave ? wave->volume : device_volume;
+	if (wave)
+		LeaveCriticalSection(&wave->lock);
+	return volume ? MMSYSERR_NOERROR : MMSYSERR_INVALPARAM;
 }
 
 EXPORT MMRESULT WINAPI waveOutSetVolume(HWAVEOUT handle, DWORD volume)
@@ -682,15 +657,17 @@ EXPORT MMRESULT WINAPI waveOutSetVolume(HWAVEOUT handle, DWORD volume)
 	wave *wave = wave_of(handle, FALSE);
 	if (!wave && !device_id_valid((UINT_PTR)handle))
 		return MMSYSERR_INVALHANDLE;
-	if (wave)
+	if (wave) {
 		wave->volume = volume;
-	else
+		LeaveCriticalSection(&wave->lock);
+	} else {
 		device_volume = volume;
+	}
 	wave_volumes_changed();
 	return MMSYSERR_NOERROR;
 }
 
-static MMRESULT unsupported(HWAVEOUT handle) { return wave_of(handle, FALSE) ? MMSYSERR_NOTSUPPORTED : MMSYSERR_INVALHANDLE; }
+static MMRESULT unsupported(HWAVEOUT handle) { return wave_known(handle, FALSE) ? MMSYSERR_NOTSUPPORTED : MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI waveOutGetPitch(HWAVEOUT handle, LPDWORD pitch) { return unsupported(handle); }
 EXPORT MMRESULT WINAPI waveOutSetPitch(HWAVEOUT handle, DWORD pitch) { return unsupported(handle); }
 EXPORT MMRESULT WINAPI waveOutGetPlaybackRate(HWAVEOUT handle, LPDWORD rate) { return unsupported(handle); }
@@ -698,7 +675,7 @@ EXPORT MMRESULT WINAPI waveOutSetPlaybackRate(HWAVEOUT handle, DWORD rate) { ret
 
 EXPORT MMRESULT WINAPI waveOutGetID(HWAVEOUT handle, LPUINT id)
 {
-	if (!wave_of(handle, FALSE))
+	if (!wave_known(handle, FALSE))
 		return MMSYSERR_INVALHANDLE;
 	if (!id)
 		return MMSYSERR_INVALPARAM;
@@ -724,16 +701,14 @@ static void input_caps(UINT_PTR id, WAVEINCAPSW *caps)
 	caps->wMid = MM_MICROSOFT;
 	caps->wPid = id == 0 ? MM_MSFT_WSS_WAVEIN : MM_WAVE_MAPPER;
 	caps->vDriverVersion = 0x0500;
-	const WCHAR *name = id == 0 ? L"Microphone (Raven Audio)" : L"Microsoft Sound Mapper";
-	for (size_t index = 0; name[index]; index++)
-		caps->szPname[index] = name[index];
+	lstrcpynW(caps->szPname, id == 0 ? L"Microphone (Raven Audio)" : L"Microsoft Sound Mapper", MAXPNAMELEN);
 	caps->dwFormats = 0x000fffff;
 	caps->wChannels = 2;
 }
 
 static MMRESULT input_id(UINT_PTR id, UINT_PTR *device)
 {
-	if (wave_of((void *)id, TRUE)) {
+	if (wave_known((void *)id, TRUE)) {
 		*device = 0;
 		return MMSYSERR_NOERROR;
 	}
@@ -795,14 +770,12 @@ EXPORT MMRESULT WINAPI waveInStart(HWAVEIN handle)
 	wave *wave = wave_of(handle, TRUE);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
-	if (!wave->started) {
-		RavenAudioStart(wave->stream);
-		wave->started = TRUE;
-	}
-	LeaveCriticalSection(&wave->lock);
+	if (!wave->started)
+		wave->started = RavenAudioStart(wave->stream);
+	const BOOL started = wave->started;
 	SetEvent(wave->wake);
-	return MMSYSERR_NOERROR;
+	LeaveCriticalSection(&wave->lock);
+	return started ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
 }
 
 /* Stops recording; the buffer being filled comes back with what it holds, the empty ones stay queued. */
@@ -811,7 +784,6 @@ EXPORT MMRESULT WINAPI waveInStop(HWAVEIN handle)
 	wave *wave = wave_of(handle, TRUE);
 	if (!wave)
 		return MMSYSERR_INVALHANDLE;
-	EnterCriticalSection(&wave->lock);
 	WAVEHDR *done = NULL;
 	if (wave->started) {
 		RavenAudioStop(wave->stream);
@@ -829,8 +801,9 @@ EXPORT MMRESULT WINAPI waveInStop(HWAVEIN handle)
 			(*tail)->dwFlags = ((*tail)->dwFlags & ~WHDR_INQUEUE) | WHDR_DONE;
 		}
 	}
+	const notify notify = wave->notify;
 	LeaveCriticalSection(&wave->lock);
-	hand_back(wave, done);
+	hand_back(&notify, (HANDLE)handle, TRUE, done);
 	return MMSYSERR_NOERROR;
 }
 
@@ -838,7 +811,7 @@ EXPORT MMRESULT WINAPI waveInGetPosition(HWAVEIN handle, LPMMTIME time, UINT siz
 
 EXPORT MMRESULT WINAPI waveInGetID(HWAVEIN handle, LPUINT id)
 {
-	if (!wave_of(handle, TRUE))
+	if (!wave_known(handle, TRUE))
 		return MMSYSERR_INVALHANDLE;
 	if (!id)
 		return MMSYSERR_INVALPARAM;

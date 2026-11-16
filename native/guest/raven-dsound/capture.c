@@ -152,20 +152,7 @@ static HRESULT WINAPI capture_buffer_GetCurrentPosition(IDirectSoundCaptureBuffe
 
 static HRESULT WINAPI capture_buffer_GetFormat(IDirectSoundCaptureBuffer8 *iface, WAVEFORMATEX *format, DWORD size, DWORD *written)
 {
-	const WAVEFORMATEX *own = &capture_buffer_from(iface)->data->format.Format;
-	const DWORD needed = sizeof(WAVEFORMATEX) + own->cbSize;
-	if (!format && !written)
-		return DSERR_INVALIDPARAM;
-	if (!format) {
-		*written = needed;
-		return DS_OK;
-	}
-	if (size < needed)
-		return DSERR_INVALIDPARAM;
-	memcpy(format, own, needed);
-	if (written)
-		*written = needed;
-	return DS_OK;
+	return format_copy(&capture_buffer_from(iface)->data->format.Format, format, size, written);
 }
 
 static HRESULT WINAPI capture_buffer_GetStatus(IDirectSoundCaptureBuffer8 *iface, DWORD *status)
@@ -201,11 +188,11 @@ static HRESULT WINAPI capture_buffer_Start(IDirectSoundCaptureBuffer8 *iface, DW
 	buffer->looping = (flags & DSCBSTART_LOOPING) != 0;
 	if (!buffer->capturing) {
 		RavenAudioReset(buffer->stream);
-		buffer->capturing = TRUE;
-		RavenAudioStart(buffer->stream);
+		buffer->capturing = RavenAudioStart(buffer->stream);
 	}
+	const HRESULT result = buffer->capturing ? DS_OK : DSERR_NODRIVER;
 	LeaveCriticalSection(&ds_lock);
-	return DS_OK;
+	return result;
 }
 
 static HRESULT WINAPI capture_buffer_Stop(IDirectSoundCaptureBuffer8 *iface)

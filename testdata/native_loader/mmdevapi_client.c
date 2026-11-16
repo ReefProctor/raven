@@ -343,6 +343,10 @@ static int playback(void)
 		return 27;
 	if (IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, mix, NULL) == S_OK) return 27;
 	if (IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, &cd, NULL) != AUDCLNT_E_UNSUPPORTED_FORMAT) return 28;
+	/* A duration whose frame count does not fit 64 bits is refused, not wrapped into a small buffer. */
+	if (IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 0x7fffffffffffffffll, 0, mix, NULL) != AUDCLNT_E_BUFFER_SIZE_ERROR ||
+		IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 100000001, 0, mix, NULL) != AUDCLNT_E_BUFFER_SIZE_ERROR)
+		return 199;
 	if (IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, mix, NULL) != S_OK) return 29;
 	if (IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, mix, NULL) !=
 		AUDCLNT_E_ALREADY_INITIALIZED) return 30;

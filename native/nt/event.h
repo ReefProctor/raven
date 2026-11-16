@@ -24,8 +24,11 @@ public:
 	// so a waiter that the scheduler looks at later is still released and nobody else ever sees the event set.
 	void grant_pulse(uint32_t thread);
 	void revoke_pulse(uint32_t thread);
-	// Releases the host threads blocked on the event the way a pulse does, without changing its state.
-	void pulse_host_waiters();
+	// Releases the host threads blocked on the event the way a pulse does, without changing its state. True when that used up the
+	// pulse of an auto-reset event.
+	bool pulse_host_waiters();
+	// Shows the event set to the processes that share it. The caller resets it; a waiter there is released only if it looks before that.
+	void pulse_other_processes();
 
 private:
 	friend class NativeObjects;

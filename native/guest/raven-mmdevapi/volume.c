@@ -20,8 +20,8 @@ static float mean(const float *levels, UINT count)
 	return count ? sum / count : 1;
 }
 
-static BOOL level_valid(float level) { return level >= 0 && level <= 1; }
 
+/* shortcut: a stream has one gain, so channel levels are averaged into it, carry one gain per channel when the host stream has them. */
 void update_volumes(void)
 {
 	for (client *audio = clients; audio; audio = audio->next) {
@@ -94,28 +94,24 @@ static void release_snapshot(IUnknown **listeners, UINT count)
 	FREE(listeners);
 }
 
-#define SESSION_SNAPSHOT(owner, copy, count)                                                        \
-	do {                                                                                        \
-		count = (owner)->listener_count;                                                    \
-		copy = (IAudioSessionEvents **)snapshot((IUnknown **)(owner)->listeners, count);    \
-		if (!copy)                                                                          \
-			count = 0;                                                                  \
-	} while (0)
+/* The session's listeners, to be told once audio_lock is left. FALSE when they cannot be copied: the caller then changes nothing. */
+static BOOL session_snapshot(session *owner, IAudioSessionEvents ***copy, UINT *count)
+{
+	*count = owner->listener_count;
+	*copy = (IAudioSessionEvents **)snapshot((IUnknown **)owner->listeners, *count);
+	if (!*copy && *count) {
+		*count = 0;
+		return FALSE;
+	}
+	return TRUE;
+}
 
 /* ----- Sessions ----- */
-
-static size_t text_length(const WCHAR *text)
-{
-	size_t length = 0;
-	while (text[length])
-		length++;
-	return length;
-}
 
 /* A heap copy of a string the program passed, for the session to keep. */
 static WCHAR *keep_string(const WCHAR *text)
 {
-	const size_t size = (text_length(text) + 1) * sizeof(WCHAR);
+	const size_t size = ((size_t)lstrlenW(text) + 1) * sizeof(WCHAR);
 	WCHAR *copy = ALLOC(size);
 	if (copy)
 		memcpy(copy, text, size);
@@ -186,10 +182,14 @@ static HRESULT WINAPI control_SetDisplayName(IAudioSessionControl2 *iface, LPCWS
 	if (!copy)
 		return E_OUTOFMEMORY;
 	EnterCriticalSection(&audio_lock);
+	if (!session_snapshot(owner, &listeners, &count)) {
+		LeaveCriticalSection(&audio_lock);
+		FREE(copy);
+		return E_OUTOFMEMORY;
+	}
 	if (owner->display_name)
 		FREE(owner->display_name);
 	owner->display_name = copy;
-	SESSION_SNAPSHOT(owner, listeners, count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnDisplayNameChanged(listeners[index], name, context);
@@ -213,10 +213,14 @@ static HRESULT WINAPI control_SetIconPath(IAudioSessionControl2 *iface, LPCWSTR 
 	if (!copy)
 		return E_OUTOFMEMORY;
 	EnterCriticalSection(&audio_lock);
+	if (!session_snapshot(owner, &listeners, &count)) {
+		LeaveCriticalSection(&audio_lock);
+		FREE(copy);
+		return E_OUTOFMEMORY;
+	}
 	if (owner->icon_path)
 		FREE(owner->icon_path);
 	owner->icon_path = copy;
-	SESSION_SNAPSHOT(owner, listeners, count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnIconPathChanged(listeners[index], path, context);
@@ -243,8 +247,11 @@ static HRESULT WINAPI control_SetGroupingParam(IAudioSessionControl2 *iface, LPC
 	if (!grouping)
 		return E_POINTER;
 	EnterCriticalSection(&audio_lock);
+	if (!session_snapshot(owner, &listeners, &count)) {
+		LeaveCriticalSection(&audio_lock);
+		return E_OUTOFMEMORY;
+	}
 	owner->grouping = *grouping;
-	SESSION_SNAPSHOT(owner, listeners, count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnGroupingParamChanged(listeners[index], grouping, context);
@@ -349,6 +356,10 @@ static HRESULT simple_changed(session *owner, const float *level, const BOOL *mu
 	IAudioSessionEvents **listeners;
 	UINT count;
 	EnterCriticalSection(&audio_lock);
+	if (!session_snapshot(owner, &listeners, &count)) {
+		LeaveCriticalSection(&audio_lock);
+		return E_OUTOFMEMORY;
+	}
 	if (level)
 		owner->volume = *level;
 	if (mute)
@@ -356,7 +367,6 @@ static HRESULT simple_changed(session *owner, const float *level, const BOOL *mu
 	update_volumes();
 	const float now = owner->volume;
 	const BOOL muted = owner->mute;
-	SESSION_SNAPSHOT(owner, listeners, count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnSimpleVolumeChanged(listeners[index], now, muted, context);
@@ -424,12 +434,15 @@ static HRESULT channels_changed(session *owner, const float *levels, DWORD chang
 	UINT count;
 	float now[MIX_CHANNELS];
 	EnterCriticalSection(&audio_lock);
+	if (!session_snapshot(owner, &listeners, &count)) {
+		LeaveCriticalSection(&audio_lock);
+		return E_OUTOFMEMORY;
+	}
 	for (UINT index = 0; index < MIX_CHANNELS; index++)
 		if (changed == (DWORD)-1 || changed == index)
 			owner->channels[index] = levels[changed == (DWORD)-1 ? index : 0];
 	update_volumes();
 	memcpy(now, owner->channels, sizeof(now));
-	SESSION_SNAPSHOT(owner, listeners, count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnChannelVolumeChanged(listeners[index], MIX_CHANNELS, now, changed, context);
@@ -517,8 +530,9 @@ void session_started(session *owner, BOOL started)
 	UINT count = 0;
 	EnterCriticalSection(&audio_lock);
 	const BOOL changed = started ? ++owner->running == 1 : --owner->running == 0;
+	/* The stream has started or stopped already; without memory for the copy the listeners are not told. */
 	if (changed)
-		SESSION_SNAPSHOT(owner, listeners, count);
+		session_snapshot(owner, &listeners, &count);
 	LeaveCriticalSection(&audio_lock);
 	for (UINT index = 0; index < count; index++)
 		IAudioSessionEvents_OnStateChanged(listeners[index], started ? AudioSessionStateActive : AudioSessionStateInactive);
@@ -646,7 +660,8 @@ static HRESULT WINAPI manager_GetSessionEnumerator(IAudioSessionManager2 *iface,
 	return S_OK;
 }
 
-/* Sessions are made only by this process and nothing ducks: no listener of these is ever told anything. */
+/* shortcut: these listeners are not kept, because only this process makes sessions and nothing ducks; keep and tell them when the
+ * sessions of other processes are listed. */
 static HRESULT WINAPI manager_RegisterSessionNotification(IAudioSessionManager2 *iface, IAudioSessionNotification *notification)
 {
 	return notification ? S_OK : E_POINTER;
@@ -719,6 +734,14 @@ static HRESULT endpoint_changed(endpoint_volume *volume, const float *master, UI
 	IAudioEndpointVolumeCallback **listeners;
 	UINT count;
 	EnterCriticalSection(&audio_lock);
+	count = volume->listener_count;
+	listeners = (IAudioEndpointVolumeCallback **)snapshot((IUnknown **)volume->listeners, count);
+	AUDIO_VOLUME_NOTIFICATION_DATA *data = listeners ? ALLOC(sizeof(*data) + (MIX_CHANNELS - 1) * sizeof(float)) : NULL;
+	if (count && !data) {
+		LeaveCriticalSection(&audio_lock);
+		release_snapshot((IUnknown **)listeners, count);
+		return E_OUTOFMEMORY;
+	}
 	if (master)
 		volume->master = *master;
 	if (level)
@@ -726,11 +749,6 @@ static HRESULT endpoint_changed(endpoint_volume *volume, const float *master, UI
 	if (mute)
 		volume->mute = *mute;
 	update_volumes();
-	count = volume->listener_count;
-	listeners = (IAudioEndpointVolumeCallback **)snapshot((IUnknown **)volume->listeners, count);
-	if (!listeners)
-		count = 0;
-	AUDIO_VOLUME_NOTIFICATION_DATA *data = count ? ALLOC(sizeof(*data) + (MIX_CHANNELS - 1) * sizeof(float)) : NULL;
 	if (data) {
 		data->guidEventContext = context ? *context : GUID_NULL;
 		data->bMuted = volume->mute;
@@ -932,7 +950,7 @@ static HRESULT WINAPI meter_QueryInterface(IAudioMeterInformation *iface, REFIID
 static ULONG WINAPI meter_AddRef(IAudioMeterInformation *iface) { return 2; }
 static ULONG WINAPI meter_Release(IAudioMeterInformation *iface) { return 1; }
 
-/* The engine mixes in the sound server, out of the guest's sight: the meter reads silence. */
+/* shortcut: the meter reads silence because the sound server mixes out of the guest's sight, read peaks from the host when it reports them. */
 static HRESULT WINAPI meter_GetPeakValue(IAudioMeterInformation *iface, float *peak)
 {
 	if (!peak)
@@ -978,7 +996,6 @@ void volume_init(device *device)
 	device->IAudioSessionManager2_iface.lpVtbl = &manager_vtbl;
 	device->IAudioMeterInformation_iface.lpVtbl = &meter_vtbl;
 	device->volume.IAudioEndpointVolumeEx_iface.lpVtbl = &endpoint_vtbl;
-	device->volume.device = device;
 	device->volume.master = 1;
 	for (UINT index = 0; index < MIX_CHANNELS; index++)
 		device->volume.channels[index] = 1;

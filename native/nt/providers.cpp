@@ -3056,7 +3056,8 @@ NativeResult run_native_process(ModuleSet &modules, PEModule &entry,
 	register_job_api(api_registry, kernel);
 	register_wave_api(api_registry, kernel);
 	register_mmio_api(api_registry, kernel);
-	register_winmm_api(api_registry, kernel, register_pulse_event(api_registry, kernel));
+	register_pulse_event(api_registry, kernel);
+	register_winmm_api(api_registry);
 	register_crypt32_api(api_registry, kernel);
 	register_bcrypt_api(api_registry, kernel);
 	register_process_info_api(api_registry, kernel);

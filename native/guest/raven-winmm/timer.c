@@ -74,8 +74,8 @@ static DWORD WINAPI timer_main(void *unused)
 		const BOOL periodic = due->flags & TIME_PERIODIC;
 		if (periodic) {
 			due->deadline += ticks_of(due->delay);
-			if (due->deadline < at)
-				due->deadline = at;
+			if (due->deadline <= at)
+				due->deadline = at + ticks_of(due->delay);
 		} else {
 			unlink_timer(due);
 		}

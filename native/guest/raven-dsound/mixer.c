@@ -231,10 +231,8 @@ static void device_mix(device *device)
 		device->mixed += frames;
 	}
 	store64(&shared->write_frames, device->mixed);
-	if (!device->running) {
-		RavenAudioStart(device->stream);
-		device->running = TRUE;
-	}
+	if (!device->running)
+		device->running = RavenAudioStart(device->stream);
 	for (buffer *each = device->buffers; each; each = each->next)
 		if (each->playing)
 			buffer_notify(each, heard);

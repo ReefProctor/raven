@@ -7,6 +7,7 @@
 #include <mferror.h>
 #include <mmreg.h>
 #include <msacm.h>
+#include <strmif.h>
 
 static int same_guid(const GUID *left, const GUID *right)
 {
@@ -129,6 +130,14 @@ int raven_entry(void)
 		!extensible_roundtrip || extensible_roundtrip->wFormatTag != WAVE_FORMAT_PCM)
 		return 55;
 	CoTaskMemFree(extensible_roundtrip);
+	if (MFCreateWaveFormatExFromMFMediaType(extensible_type, &extensible_roundtrip, &extensible_size,
+			MFWaveFormatExConvertFlag_ForceExtensible) != S_OK || extensible_size != sizeof(WAVEFORMATEXTENSIBLE) ||
+		extensible_roundtrip->wFormatTag != WAVE_FORMAT_EXTENSIBLE || extensible_roundtrip->cbSize != 22 ||
+		((WAVEFORMATEXTENSIBLE *)extensible_roundtrip)->dwChannelMask != 3 ||
+		((WAVEFORMATEXTENSIBLE *)extensible_roundtrip)->Samples.wValidBitsPerSample != 16 ||
+		!same_guid(&((WAVEFORMATEXTENSIBLE *)extensible_roundtrip)->SubFormat, &mf_audio_pcm))
+		return 56;
+	CoTaskMemFree(extensible_roundtrip);
 	IMFMediaType_Release(extensible_type);
 	GUID major;
 	if (IMFMediaType_GetMajorType(type, &major) != S_OK || !same_guid(&major, &media_type_audio))
@@ -141,10 +150,31 @@ int raven_entry(void)
 		return 10;
 	CoTaskMemFree(roundtrip);
 	void *representation = NULL;
-	if (IMFMediaType_GetRepresentation(type, wave_format_representation, &representation) != S_OK || !representation ||
-		((WAVEFORMATEX *)representation)->nSamplesPerSec != wave.nSamplesPerSec ||
+	const AM_MEDIA_TYPE *media;
+	if (IMFMediaType_GetRepresentation(type, wave_format_representation, &representation) != S_OK || !(media = representation) ||
+		!same_guid(&media->majortype, &media_type_audio) || !same_guid(&media->subtype, &mf_audio_pcm) ||
+		!same_guid(&media->formattype, &wave_format_representation) || media->cbFormat != sizeof(WAVEFORMATEX) ||
+		media->lSampleSize != wave.nBlockAlign ||
+		((const WAVEFORMATEX *)media->pbFormat)->nSamplesPerSec != wave.nSamplesPerSec ||
 		IMFMediaType_FreeRepresentation(type, wave_format_representation, representation) != S_OK)
 		return 34;
+	if (IMFMediaType_GetRepresentation(type, mf_mt_subtype, &representation) != MF_E_UNSUPPORTED_REPRESENTATION || representation)
+		return 57;
+	/* A missing key deletes without error, a NULL value only asks whether the key exists, and a blob needs its bytes. */
+	GUID index_key;
+	UINT32 item_count = 0;
+	PROPVARIANT empty_blob = {0};
+	empty_blob.vt = VT_BLOB;
+	empty_blob.blob.cbSize = 4;
+	if (IMFMediaType_DeleteItem(type, &mf_audio_channel_mask) != S_OK ||
+		IMFMediaType_GetItem(type, &mf_mt_subtype, NULL) != S_OK ||
+		IMFMediaType_GetItem(type, &mf_audio_channel_mask, NULL) != MF_E_ATTRIBUTENOTFOUND ||
+		IMFMediaType_GetCount(type, &item_count) != S_OK || !item_count ||
+		IMFMediaType_GetItemByIndex(type, item_count, &index_key, NULL) != E_INVALIDARG ||
+		IMFMediaType_GetItemByIndex(type, item_count - 1, &index_key, NULL) != S_OK ||
+		IMFMediaType_SetItem(type, &mf_audio_channel_mask, &empty_blob) != E_INVALIDARG ||
+		IMFMediaType_LockStore(type) != S_OK || IMFMediaType_UnlockStore(type) != S_OK)
+		return 58;
 	IMFMediaBuffer *buffer = NULL;
 	if (MFCreateMemoryBuffer(4096, &buffer) != S_OK || !buffer)
 		return 11;
@@ -184,14 +214,14 @@ int raven_entry(void)
 	IMFMediaType_Release(type);
 	IMFSample_Release(sample);
 	IMFMediaBuffer *aligned = NULL;
-	if (MFCreateAlignedMemoryBuffer(4096, 16, &aligned) != S_OK || !aligned)
+	if (MFCreateAlignedMemoryBuffer(4096, MF_16_BYTE_ALIGNMENT, &aligned) != S_OK || !aligned)
 		return 16;
 	if (IMFMediaBuffer_Lock(aligned, &data, NULL, NULL) != S_OK || ((ULONG_PTR)data & 15))
 		return 17;
 	IMFMediaBuffer_Unlock(aligned);
 	IMFMediaBuffer_Release(aligned);
 	aligned = (IMFMediaBuffer *)0xdead;
-	if (MFCreateAlignedMemoryBuffer(4096, 3, &aligned) != E_INVALIDARG || aligned)
+	if (MFCreateAlignedMemoryBuffer(4096, 16, &aligned) != E_INVALIDARG || aligned)
 		return 27;
 	WAVEFORMATEX pcm = {WAVE_FORMAT_PCM, 1, 22050, 44100, 2, 16, 0};
 	BYTE compressed_storage[sizeof(WAVEFORMATEX) + 4 + 7 * sizeof(ADPCMCOEFSET)] = {0};
@@ -257,10 +287,21 @@ int raven_entry(void)
 	decode_header.cbSrcLength = sizeof(encoded);
 	decode_header.pbDst = (LPBYTE)decoded_samples;
 	decode_header.cbDstLength = sizeof(decoded_samples);
+	if (acmStreamConvert(decoder, &decode_header, ACM_STREAMCONVERTF_BLOCKALIGN) != ACMERR_UNPREPARED)
+		return 59;
 	if (acmStreamPrepareHeader(decoder, &decode_header, 0) != MMSYSERR_NOERROR ||
 		acmStreamConvert(decoder, &decode_header, ACM_STREAMCONVERTF_BLOCKALIGN) != MMSYSERR_NOERROR ||
 		decode_header.cbSrcLengthUsed != sizeof(encoded) || decode_header.cbDstLengthUsed != sizeof(decoded_samples))
 		return 25;
+	/* A block that starts at the largest delta and keeps the code that grows it fastest still decodes. The volatile index keeps the
+	 * compiler from calling memset, which this fixture does not link. */
+	encoded[1] = encoded[2] = 0xff;
+	for (volatile DWORD i = 7; i < sizeof(encoded); ++i)
+		encoded[i] = 0x88;
+	if (acmStreamConvert(decoder, &decode_header, ACM_STREAMCONVERTF_BLOCKALIGN) != MMSYSERR_NOERROR ||
+		decode_header.cbSrcLengthUsed != sizeof(encoded) || decode_header.cbDstLengthUsed != sizeof(decoded_samples) ||
+		decoded_samples[499] != -32768)
+		return 60;
 	if (acmStreamUnprepareHeader(decoder, &decode_header, 0) != MMSYSERR_NOERROR ||
 		acmStreamClose(decoder, 0) != MMSYSERR_NOERROR)
 		return 26;

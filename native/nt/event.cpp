@@ -134,11 +134,11 @@ void EventObject::revoke_pulse(uint32_t thread)
 	std::erase(pulses, thread);
 }
 
-void EventObject::pulse_host_waiters()
+bool EventObject::pulse_host_waiters()
 {
 	std::lock_guard lock(mutex);
 	if (waiters.empty())
-		return;
+		return false;
 	if (type == 0) {
 		for (const auto &waiter : waiters) waiter->ready = true;
 		waiters.clear();
@@ -147,6 +147,16 @@ void EventObject::pulse_host_waiters()
 		waiters.pop_front();
 	}
 	changed.notify_all();
+	return type != 0;
+}
+
+void EventObject::pulse_other_processes()
+{
+	std::lock_guard lock(mutex);
+	if (!shared)
+		return;
+	shared->signaled.store(1);
+	announce_shared_change();
 }
 
 int EventObject::set_state(bool signaled)

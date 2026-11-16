@@ -309,6 +309,41 @@ static int lifetimes(void)
 	return 0;
 }
 
+/* The page is the program's to write. The runtime keeps its own sizes, so a stream goes on after its page is overwritten. */
+static int hostile(void)
+{
+	const HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	const WAVEFORMATEX format = format_of(WAVE_FORMAT_PCM, 48000, 2, 16);
+	RavenAudioShared *shared = NULL;
+	const HANDLE stream = audio_open(&format, 0, 4800, 480, event, &shared);
+	if (!stream || !shared) return 90;
+	shared->buffer_frames = 0;
+	shared->frame_bytes = 0x10000000;
+	shared->period_frames = 0;
+	store(&shared->write_frames, 0xffffffff00000000ULL);
+	if (!audio_start(stream)) return 91;
+	for (int period = 0; period < 3; ++period)
+		if (WaitForSingleObject(event, 1000) != WAIT_OBJECT_0) return 92;
+	shared->buffer_frames = 0xffffffff;
+	for (int period = 0; period < 3; ++period)
+		if (WaitForSingleObject(event, 1000) != WAIT_OBJECT_0) return 93;
+	if (!audio_stop(stream) || !audio_close(stream)) return 94;
+	CloseHandle(event);
+
+	/* An extensible format is taken only with a whole audio subtype. */
+	WAVEFORMATEXTENSIBLE wide = {0};
+	wide.Format = format;
+	wide.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+	wide.Format.cbSize = 22;
+	wide.Samples.wValidBitsPerSample = 16;
+	wide.SubFormat = (GUID){0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+	const HANDLE good = audio_open(&wide.Format, 0, 4800, 480, NULL, &shared);
+	if (!good || !audio_close(good)) return 95;
+	wide.SubFormat.Data4[7] = 0;
+	if (audio_open(&wide.Format, 0, 4800, 480, NULL, &shared)) return 96;
+	return 0;
+}
+
 int raven_entry(void)
 {
 	int failed = wave();
@@ -316,5 +351,7 @@ int raven_entry(void)
 		failed = render();
 	if (!failed)
 		failed = capture();
+	if (!failed)
+		failed = hostile();
 	return failed ? failed : lifetimes();
 }

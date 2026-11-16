@@ -43,3 +43,46 @@ typedef struct RavenAudioShared {
 #ifdef __cplusplus
 static_assert(sizeof(RavenAudioShared) == 80 && alignof(RavenAudioShared) == 8, "the shared audio page has one layout for every guest");
 #endif
+
+#ifdef _WIN32
+/* ravenhost.dll's calls and the counters' atomic access, for the guest components. */
+__declspec(dllimport) HANDLE WINAPI RavenAudioOpen(const WAVEFORMATEX *format, DWORD flags, DWORD buffer_frames, DWORD period_frames,
+	HANDLE event, RavenAudioShared **shared);
+__declspec(dllimport) BOOL WINAPI RavenAudioSetEvent(HANDLE stream, HANDLE event);
+__declspec(dllimport) BOOL WINAPI RavenAudioStart(HANDLE stream);
+__declspec(dllimport) BOOL WINAPI RavenAudioStop(HANDLE stream);
+__declspec(dllimport) BOOL WINAPI RavenAudioReset(HANDLE stream);
+__declspec(dllimport) BOOL WINAPI RavenAudioClose(HANDLE stream);
+
+static inline UINT64 load64(const UINT64 *field) { return __atomic_load_n(field, __ATOMIC_ACQUIRE); }
+static inline void store64(UINT64 *field, UINT64 value) { __atomic_store_n(field, value, __ATOMIC_RELEASE); }
+
+/* What the engine plays: integer PCM of 8, 16, 24 or 32 bits or 32-bit float, plain or extensible, 1 to 8 channels, whole frames. */
+static inline BOOL format_valid(const WAVEFORMATEX *format)
+{
+	static const GUID subtype_base = {0x00000000, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+	WORD tag = format->wFormatTag;
+	if (tag == WAVE_FORMAT_EXTENSIBLE) {
+		if (format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
+			return FALSE;
+		const WAVEFORMATEXTENSIBLE *extensible = (const WAVEFORMATEXTENSIBLE *)format;
+		GUID sub = extensible->SubFormat;
+		const DWORD data1 = sub.Data1;
+		sub.Data1 = 0;
+		if (memcmp(&sub, &subtype_base, sizeof sub) || (data1 != WAVE_FORMAT_PCM && data1 != WAVE_FORMAT_IEEE_FLOAT))
+			return FALSE;
+		if (extensible->Samples.wValidBitsPerSample > format->wBitsPerSample)
+			return FALSE;
+		tag = (WORD)data1;
+	}
+	const WORD bits = format->wBitsPerSample;
+	if (tag == WAVE_FORMAT_PCM) {
+		if (bits != 8 && bits != 16 && bits != 24 && bits != 32)
+			return FALSE;
+	} else if (tag != WAVE_FORMAT_IEEE_FLOAT || bits != 32) {
+		return FALSE;
+	}
+	return format->nChannels >= 1 && format->nChannels <= 8 && format->nSamplesPerSec >= 1000 && format->nSamplesPerSec <= 384000 &&
+		format->nBlockAlign == format->nChannels * bits / 8;
+}
+#endif

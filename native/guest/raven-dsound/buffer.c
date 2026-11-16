@@ -43,15 +43,14 @@ HRESULT format_check(const WAVEFORMATEX *format, buffer_data *data)
 	if (data) {
 		memset(&data->format, 0, sizeof(data->format));
 		memcpy(&data->format, format, format->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? sizeof(WAVEFORMATEXTENSIBLE) : sizeof(WAVEFORMATEX));
-		if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE)
-			data->format.Format.cbSize = 0;
+		data->format.Format.cbSize = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) : 0;
 		data->sample_bytes = bits / 8;
 		data->is_float = is_float;
 	}
 	return DS_OK;
 }
 
-static HRESULT format_copy(const WAVEFORMATEX *format, WAVEFORMATEX *out, DWORD size, DWORD *written)
+HRESULT format_copy(const WAVEFORMATEX *format, WAVEFORMATEX *out, DWORD size, DWORD *written)
 {
 	const DWORD needed = sizeof(WAVEFORMATEX) + format->cbSize;
 	if (!out && !written)
@@ -101,7 +100,7 @@ HRESULT unlock_range(buffer_data *data, void *first, DWORD first_bytes, void *se
 
 HRESULT notify_set(notify_list *list, DWORD size, DWORD count, const DSBPOSITIONNOTIFY *items)
 {
-	if (count && !items)
+	if (count > DSBNOTIFICATIONS_MAX || (count && !items))
 		return DSERR_INVALIDPARAM;
 	for (DWORD index = 0; index < count; index++)
 		if (items[index].dwOffset >= size && items[index].dwOffset != (DWORD)DSBPN_OFFSETSTOP)
@@ -163,7 +162,8 @@ void buffer_reset_primary(buffer *buffer)
 static float dot(D3DVECTOR first, D3DVECTOR second) { return first.x * second.x + first.y * second.y + first.z * second.z; }
 
 /* The distance and side of the sound from the listener: the gain the inverse distance law with the listener's rolloff gives between the
- * buffer's minimum and maximum distances, and a pan toward the side it is on. Cones and the Doppler shift are not modelled. */
+ * buffer's minimum and maximum distances, and a pan toward the side it is on.
+ * shortcut: cones, velocity, the Doppler shift and the distance factor are stored and not heard, model them when a program depends on them. */
 void buffer_update_3d(buffer *buffer)
 {
 	buffer->gain_3d_left = buffer->gain_3d_right = 1;
@@ -375,6 +375,7 @@ static HRESULT WINAPI buffer_Lock(IDirectSoundBuffer8 *iface, DWORD offset, DWOR
 	DWORD *second_bytes, DWORD flags)
 {
 	buffer *buffer = buffer_from8(iface);
+	/* shortcut: the primary buffer has no memory to write, give it some when a program mixes for itself at DSSCL_WRITEPRIMARY. */
 	if (buffer->primary)
 		return buffer->device->level == DSSCL_WRITEPRIMARY ? DSERR_INVALIDCALL : DSERR_PRIOLEVELNEEDED;
 	EnterCriticalSection(&ds_lock);
@@ -1025,6 +1026,9 @@ HRESULT buffer_create(device *device, const DSBUFFERDESC *desc, buffer **out)
 	DWORD flags = desc->dwFlags;
 	if (!(flags & (DSBCAPS_LOCHARDWARE | DSBCAPS_LOCDEFER)))
 		flags |= DSBCAPS_LOCSOFTWARE;
+	/* Unsigned 8-bit silence is 0x80. */
+	if (data->memory && data->sample_bytes == 1)
+		memset(data->memory, 0x80, data->size);
 	buffer *made = data->memory ? buffer_alloc(device, flags) : NULL;
 	if (!made) {
 		FREE(data->memory);

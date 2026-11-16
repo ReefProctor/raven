@@ -117,8 +117,8 @@ void register_audio_service(ApiRegistry &registry, KernelContext &context)
 		AudioStream::Options options;
 		options.format = *format;
 		options.capture = (flags & RAVEN_AUDIO_CAPTURE) != 0;
-		options.buffer_frames = buffer;
-		options.period_frames = period;
+		options.buffer_frames = uint32_t(buffer_frames);
+		options.period_frames = uint32_t(period_frames);
 		options.notify = [target, wake] {
 			target->set();
 			wake();

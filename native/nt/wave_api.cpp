@@ -1,14 +1,17 @@
-#include "audio_engine.h"
 #include "kernel_context.h"
 #include "text.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <dlfcn.h>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace raven {
@@ -21,133 +24,195 @@ constexpr uint32_t whdr_done = 0x1, whdr_prepared = 0x2, whdr_beginloop = 0x4, w
 constexpr uint32_t callback_kind = 0x70000, callback_null = 0, callback_event = 0x50000, wave_format_query = 0x1;
 constexpr uint64_t wave_mapper = 0xffffffffU;
 
-// One opened device over a stream of the sound engine. The buffers wait in order; the device pulls their frames into the stream's ring
-// as it makes room, and a buffer is done once the stream's position, what was played, has passed its last frame.
+// The PulseAudio simple client, which PipeWire also serves, loaded when a device first opens. Without it the samples play to nowhere.
+struct SampleSpec {
+	int format;
+	uint32_t rate;
+	uint8_t channels;
+};
+
+struct BufferAttributes {
+	uint32_t maxlength, tlength, prebuf, minreq, fragsize;
+};
+
+struct Pulse {
+	void *(*open)(const char *, const char *, int, const char *, const char *, const SampleSpec *, const void *, const BufferAttributes *, int *);
+	int (*write)(void *, const void *, size_t, int *);
+	int (*flush)(void *, int *);
+	uint64_t (*latency)(void *, int *);
+	void (*close)(void *);
+};
+
+const Pulse *pulse()
+{
+	static const std::unique_ptr<Pulse> loaded = []() -> std::unique_ptr<Pulse> {
+		void *library = ::dlopen("libpulse-simple.so.0", RTLD_NOW | RTLD_LOCAL);
+		if (!library)
+			return nullptr;
+		auto api = std::make_unique<Pulse>();
+		api->open = reinterpret_cast<decltype(api->open)>(::dlsym(library, "pa_simple_new"));
+		api->write = reinterpret_cast<decltype(api->write)>(::dlsym(library, "pa_simple_write"));
+		api->flush = reinterpret_cast<decltype(api->flush)>(::dlsym(library, "pa_simple_flush"));
+		api->latency = reinterpret_cast<decltype(api->latency)>(::dlsym(library, "pa_simple_get_latency"));
+		api->close = reinterpret_cast<decltype(api->close)>(::dlsym(library, "pa_simple_free"));
+		if (!api->open || !api->write || !api->flush || !api->latency || !api->close)
+			return nullptr;
+		return api;
+	}();
+	return loaded.get();
+}
+
+struct Format {
+	uint32_t rate = 0, channels = 0, bits = 0, block = 0;
+	bool floating = false;
+	uint32_t bytes_per_second() const { return rate * block; }
+};
+
+// WAVEFORMATEX, or WAVEFORMATEXTENSIBLE naming PCM or IEEE float in its subformat.
+std::optional<Format> read_format(ApiCall &call, uint64_t address)
+{
+	const auto bytes = call.read(address, 16);
+	uint16_t tag, channels, block, bits;
+	uint32_t rate;
+	std::memcpy(&tag, bytes.data(), 2);
+	std::memcpy(&channels, bytes.data() + 2, 2);
+	std::memcpy(&rate, bytes.data() + 4, 4);
+	std::memcpy(&block, bytes.data() + 12, 2);
+	std::memcpy(&bits, bytes.data() + 14, 2);
+	if (tag == 0xfffe) {
+		const auto extended = call.read(address + 16, 26);
+		uint16_t extra;
+		std::memcpy(&extra, extended.data(), 2);
+		if (extra < 22)
+			return std::nullopt;
+		uint32_t subformat;
+		std::memcpy(&subformat, extended.data() + 10, 4);
+		tag = uint16_t(subformat);
+	}
+	Format format{rate, channels, bits, block, tag == 3};
+	if ((tag != 1 && tag != 3) || !channels || channels > 8 || rate < 1000 || rate > 384000 || block != channels * (bits / 8) ||
+		(tag == 1 && bits != 8 && bits != 16 && bits != 24 && bits != 32) || (tag == 3 && bits != 32))
+		return std::nullopt;
+	return format;
+}
+
+// One opened device: a host thread plays the buffers in order, and the headers it finished wait for the guest to be told.
 class WaveOut : public KernelObject {
 public:
-	WaveOut(const AudioFormat &format, uint32_t callback, uint64_t target, std::function<void()> wake)
-		: format(format), callback(callback), target(target)
+	WaveOut(const Format &format, uint32_t callback, uint64_t target) : format(format), callback(callback), target(target)
 	{
-		AudioStream::Options options;
-		options.format = format;
-		options.notify = std::move(wake);
-		options.refill = [this](AudioStream &) {
-			std::lock_guard lock(mutex);
-			feed();
-		};
-		stream = AudioStream::open(std::move(options));
-		if (stream)
-			stream->start();
+		if (const auto *api = pulse()) {
+			const int sample = format.floating ? 5 : format.bits == 8 ? 0 : format.bits == 16 ? 3 : format.bits == 24 ? 9 : 7;
+			const SampleSpec spec{sample, format.rate, uint8_t(format.channels)};
+			// About a twentieth of a second ahead of the speaker, so a finished header means the sound is almost out.
+			const uint32_t ahead = std::max<uint32_t>(format.bytes_per_second() / 20 / format.block * format.block, format.block);
+			const BufferAttributes attributes{UINT32_MAX, ahead, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+			int error = 0;
+			stream = api->open(nullptr, "Raven", 1, nullptr, "Windows program", &spec, nullptr, &attributes, &error);
+		}
+		worker = std::thread([this] { play(); });
 	}
-	bool opened() const { return stream != nullptr; }
-	void enqueue(uint64_t header, std::vector<uint8_t> data)
+	~WaveOut() override
 	{
-		std::lock_guard lock(mutex);
-		data.resize(data.size() / format.block * format.block);
-		enqueued += data.size() / format.block;
-		queued.push_back({header, std::move(data), 0, enqueued});
-		feed();
-	}
-	// Every buffer not played yet comes back at once, in order, and the position starts again from zero; a paused device plays again.
-	std::vector<uint64_t> reset()
-	{
-		stream->stop();
-		std::vector<uint64_t> dropped;
 		{
 			std::lock_guard lock(mutex);
-			for (const auto &item : queued)
-				dropped.push_back(item.header);
-			queued.clear();
-			enqueued = 0;
+			stopping = true;
 		}
-		stream->reset();
-		stream->start();
-		return dropped;
+		changed.notify_all();
+		worker.join();
+		if (stream)
+			pulse()->close(stream);
 	}
-	void pause(bool value) { value ? stream->stop() : stream->start(); }
+	void enqueue(uint64_t header, std::vector<uint8_t> data)
+	{
+		{
+			std::lock_guard lock(mutex);
+			queued.push_back({header, std::move(data)});
+		}
+		changed.notify_all();
+	}
+	// Every buffer not played yet finishes now, and the position starts again from zero.
+	void reset()
+	{
+		std::lock_guard lock(mutex);
+		for (const auto &item : queued)
+			finished.push_back(item.header);
+		queued.clear();
+		played = 0;
+		paused = false;
+		if (stream) {
+			int error = 0;
+			pulse()->flush(stream, &error);
+		}
+		changed.notify_all();
+	}
+	void pause(bool value)
+	{
+		{
+			std::lock_guard lock(mutex);
+			paused = value;
+		}
+		changed.notify_all();
+	}
 	bool busy()
 	{
 		std::lock_guard lock(mutex);
-		return !queued.empty();
+		return !queued.empty() || playing;
 	}
-	// The buffers whose last frame was played, in order.
 	std::vector<uint64_t> take_finished()
 	{
-		const uint64_t played = stream->position();
-		std::vector<uint64_t> finished;
 		std::lock_guard lock(mutex);
-		while (!queued.empty() && queued.front().end <= played) {
-			finished.push_back(queued.front().header);
-			queued.pop_front();
-		}
-		return finished;
+		return std::exchange(finished, {});
 	}
-	uint64_t position_bytes() const { return stream->position() * format.block; }
+	uint64_t position()
+	{
+		std::lock_guard lock(mutex);
+		return played;
+	}
 
-	const AudioFormat format;
+	const Format format;
 	const uint32_t callback;
 	const uint64_t target;
-	// Left and right halves of the word; applied as frames go into the ring, so a change reaches buffers already queued.
-	std::atomic<uint32_t> volume = 0xffffffffU;
+	uint32_t volume = 0xffffffffU;
 
 private:
 	struct Item {
 		uint64_t header;
 		std::vector<uint8_t> data;
-		// Bytes already in the ring, and the stream frame just past the buffer's last.
-		size_t sent;
-		uint64_t end;
 	};
-	// With the mutex held: as much of the waiting buffers as the ring has room for.
-	void feed()
+	void play()
 	{
-		const uint32_t level = volume.load(std::memory_order_relaxed);
-		for (auto &item : queued) {
-			if (item.sent == item.data.size())
-				continue;
-			const uint64_t frames = (item.data.size() - item.sent) / format.block;
-			uint64_t taken;
-			if (level == 0xffffffffU)
-				taken = stream->write(item.data.data() + item.sent, frames);
-			else {
-				const uint64_t room = std::min(frames, stream->space());
-				scratch.assign(item.data.begin() + item.sent, item.data.begin() + item.sent + room * format.block);
-				scale(scratch, level);
-				taken = stream->write(scratch.data(), room);
-			}
-			item.sent += taken * format.block;
-			if (taken < frames)
+		std::unique_lock lock(mutex);
+		for (;;) {
+			changed.wait(lock, [&] { return stopping || (!paused && !queued.empty()); });
+			if (stopping)
 				return;
+			auto item = std::move(queued.front());
+			queued.pop_front();
+			playing = true;
+			lock.unlock();
+			if (stream) {
+				int error = 0;
+				pulse()->write(stream, item.data.data(), item.data.size(), &error);
+			} else {
+				// Played to nowhere at the pace of the format.
+				std::this_thread::sleep_for(std::chrono::microseconds(uint64_t(item.data.size()) * 1000000 / std::max(format.bytes_per_second(), 1U)));
+			}
+			lock.lock();
+			playing = false;
+			played += item.data.size();
+			finished.push_back(item.header);
 		}
 	}
-	// The formats a volume applies to: 16-bit integers and floats, the left half of the word for the first channel, the right for the
-	// second, and the left again for any further.
-	void scale(std::vector<uint8_t> &samples, uint32_t level) const
-	{
-		const float left = float(level & 0xffff) / 65535.0f, right = float(level >> 16) / 65535.0f;
-		const size_t channels = format.channels;
-		if (format.floating)
-			for (size_t index = 0; index + 4 <= samples.size(); index += 4) {
-				float value;
-				std::memcpy(&value, samples.data() + index, 4);
-				value *= (index / 4) % channels == 1 ? right : left;
-				std::memcpy(samples.data() + index, &value, 4);
-			}
-		else if (format.bits == 16)
-			for (size_t index = 0; index + 2 <= samples.size(); index += 2) {
-				int16_t value;
-				std::memcpy(&value, samples.data() + index, 2);
-				value = int16_t(float(value) * ((index / 2) % channels == 1 ? right : left));
-				std::memcpy(samples.data() + index, &value, 2);
-			}
-	}
 
+	void *stream = nullptr;
 	std::mutex mutex;
+	std::condition_variable changed;
 	std::deque<Item> queued;
-	std::vector<uint8_t> scratch;
-	uint64_t enqueued = 0;
-	// Last, so the device's threads end before the queue they feed from goes.
-	std::unique_ptr<AudioStream> stream;
+	std::vector<uint64_t> finished;
+	uint64_t played = 0;
+	bool stopping = false, paused = false, playing = false;
+	std::thread worker;
 };
 
 }
@@ -176,35 +241,32 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 	const auto device_of = [&objects](uint64_t handle) { return objects.object_as<WaveOut>(handle); };
 	const auto flags_at = [](ApiCall &call, uint64_t header) { return header + (call.pointer_width() == 4 ? 16 : 24); };
 
-	// A finished buffer's header turns done and leaves the queue, and an event callback is told.
-	const auto finish = [&context](WaveOut &device, const std::vector<uint64_t> &headers) {
-		const uint64_t offset = context.process.mode() == NativeMode::x86 ? 16 : 24;
-		for (const auto header : headers) {
-			try {
-				const auto raw = context.process.read_memory(header + offset, 4);
-				uint32_t flags;
-				std::memcpy(&flags, raw.data(), 4);
-				flags = (flags | whdr_done) & ~whdr_inqueue;
-				context.process.write_memory(header + offset, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&flags), 4));
-			} catch (...) {
-			}
-			if (device.callback == callback_event && device.target)
-				context.objects.set_event(device.target, true);
-		}
-	};
-	// Played buffers are marked done whenever the scheduler runs; the device's thread wakes it once a period while sound plays.
-	context.threads.add_service([devices, finish] {
+	// Finished headers are marked done whenever the scheduler runs, so a program that watches WHDR_DONE sees its buffers come back.
+	context.threads.add_service([devices, &context] {
 		for (auto entry = devices->begin(); entry != devices->end();) {
 			const auto device = entry->second.lock();
 			if (!device) {
 				entry = devices->erase(entry);
 				continue;
 			}
-			finish(*device, device->take_finished());
+			const auto done = device->take_finished();
+			const size_t width = context.process.mode() == NativeMode::x86 ? 4 : 8;
+			for (const auto header : done) {
+				try {
+					const uint64_t at = header + (width == 4 ? 16 : 24);
+					const auto raw = context.process.read_memory(at, 4);
+					uint32_t flags;
+					std::memcpy(&flags, raw.data(), 4);
+					flags = (flags | whdr_done) & ~whdr_inqueue;
+					context.process.write_memory(at, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&flags), 4));
+				} catch (...) {
+				}
+				if (device->callback == callback_event && device->target)
+					context.objects.set_event(device->target, true);
+			}
 			++entry;
 		}
 	});
-	const auto wake = context.threads.remote_nudge();
 
 	registry.add("waveOutGetNumDevs", 0, [](ApiCall &call) { call.ret(1); });
 	// System and file sounds are accepted without being played, so a program that beeps or chimes goes on as if it had.
@@ -260,7 +322,7 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 			call.write(call[1], std::span<const uint8_t>(caps.data(), std::min<size_t>(size, call.u32(2))));
 			call.ret(0);
 		});
-	registry.add("waveOutOpen", 6, [&objects, devices, wake](ApiCall &call) {
+	registry.add("waveOutOpen", 6, [&objects, devices](ApiCall &call) {
 		const uint32_t flags = call.u32(5);
 		if (call[1] != 0 && uint32_t(call[1]) != uint32_t(wave_mapper)) {
 			call.ret(mmsyserr_baddeviceid);
@@ -270,7 +332,7 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(mmsyserr_invalparam);
 			return;
 		}
-		const auto format = read_wave_format(call, call[2]);
+		const auto format = read_format(call, call[2]);
 		if (!format) {
 			call.ret(waverr_badformat);
 			return;
@@ -289,11 +351,7 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(mmsyserr_invalparam);
 			return;
 		}
-		const auto device = std::make_shared<WaveOut>(*format, kind, kind == callback_event ? call[3] : 0, wake);
-		if (!device->opened()) {
-			call.ret(mmsyserr_nomem);
-			return;
-		}
+		const auto device = std::make_shared<WaveOut>(*format, kind, kind == callback_event ? call[3] : 0);
 		const auto made = objects.add_object(device);
 		if (made.status) {
 			call.ret(mmsyserr_nomem);
@@ -369,19 +427,36 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 				repeated.insert(repeated.end(), samples.begin(), samples.end());
 			samples = std::move(repeated);
 		}
+		// The volume scales samples of the formats it can: 16-bit integers and floats, left and right halves of the volume word.
+		if (device->volume != 0xffffffffU) {
+			const float left = float(device->volume & 0xffff) / 65535.0f, right = float(device->volume >> 16) / 65535.0f;
+			const size_t channels = device->format.channels;
+			if (device->format.floating)
+				for (size_t index = 0; index + 4 <= samples.size(); index += 4) {
+					float value;
+					std::memcpy(&value, samples.data() + index, 4);
+					value *= (index / 4) % channels == 1 ? right : left;
+					std::memcpy(samples.data() + index, &value, 4);
+				}
+			else if (device->format.bits == 16)
+				for (size_t index = 0; index + 2 <= samples.size(); index += 2) {
+					int16_t value;
+					std::memcpy(&value, samples.data() + index, 2);
+					value = int16_t(float(value) * ((index / 2) % channels == 1 ? right : left));
+					std::memcpy(samples.data() + index, &value, 2);
+				}
+		}
 		call.store<uint32_t>(at, (flags & ~whdr_done) | whdr_inqueue);
 		device->enqueue(call[1], std::move(samples));
 		call.ret(0);
 	});
-	// The buffers come back before the call returns, as programs that free them right after it expect.
-	registry.add("waveOutReset", 1, [device_of, finish](ApiCall &call) {
+	registry.add("waveOutReset", 1, [device_of](ApiCall &call) {
 		const auto device = device_of(call[0]);
 		if (!device) {
 			call.ret(mmsyserr_invalhandle);
 			return;
 		}
-		finish(*device, device->take_finished());
-		finish(*device, device->reset());
+		device->reset();
 		call.ret(0);
 	});
 	registry.add("waveOutPause", 1, [device_of](ApiCall &call) {
@@ -416,7 +491,7 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(mmsyserr_invalparam);
 			return;
 		}
-		const uint64_t bytes = device->position_bytes();
+		const uint64_t bytes = device->position();
 		uint32_t kind = call.load<uint32_t>(call[1]), value;
 		if (kind == 1)
 			value = uint32_t(bytes * 1000 / std::max(device->format.bytes_per_second(), 1U));
@@ -436,7 +511,7 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(mmsyserr_invalparam);
 			return;
 		}
-		call.store<uint32_t>(call[1], device ? device->volume.load() : 0xffffffffU);
+		call.store<uint32_t>(call[1], device ? device->volume : 0xffffffffU);
 		call.ret(0);
 	});
 	registry.add("waveOutSetVolume", 2, [device_of](ApiCall &call) {

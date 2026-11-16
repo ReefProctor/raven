@@ -2,6 +2,9 @@
  * Copyright (c) 2026 Mirko Brombin
  * See LICENSES/MIT.txt.
  */
+/* Raven Media Foundation component: mfplat.dll, the samples, media types and buffers media libraries carry their data in.
+ *
+ * These objects only hold attributes and bytes, so they are complete without a media pipeline behind them. */
 #define INITGUID
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -10,6 +13,7 @@
 #include <mferror.h>
 #include <mfobjects.h>
 #include <propvarutil.h>
+#include <strmif.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -49,6 +53,8 @@ typedef struct mf_object {
 		IMFSample sample;
 	};
 	LONG ref;
+	/* Guards the attributes and the sample fields. A temporary object that never leaves one call has none. */
+	CRITICAL_SECTION lock;
 	attribute *attributes;
 	UINT32 attribute_count, attribute_capacity;
 	DWORD sample_flags;
@@ -176,12 +182,13 @@ static HRESULT attribute_store(mf_object *object, REFGUID key, const attribute *
 
 static HRESULT attribute_get_item(mf_object *object, REFGUID key, PROPVARIANT *value)
 {
-	if (!value)
-		return E_POINTER;
-	PropVariantInit(value);
 	attribute *item = attribute_find(object, key);
 	if (!item)
 		return MF_E_ATTRIBUTENOTFOUND;
+	/* A caller passes no value to ask only whether the key exists. */
+	if (!value)
+		return S_OK;
+	PropVariantInit(value);
 	switch (item->kind) {
 	case ATTRIBUTE_U32:
 		value->vt = VT_UI4;
@@ -266,11 +273,15 @@ static HRESULT attribute_from_variant(mf_object *object, REFGUID key, REFPROPVAR
 		item.value.string = value->pwszVal;
 		break;
 	case VT_BLOB:
+		if (value->blob.cbSize && !value->blob.pBlobData)
+			return E_INVALIDARG;
 		item.kind = ATTRIBUTE_BLOB;
 		item.value.blob.size = value->blob.cbSize;
 		item.value.blob.data = value->blob.pBlobData;
 		break;
 	case VT_VECTOR | VT_UI1:
+		if (value->caub.cElems && !value->caub.pElems)
+			return E_INVALIDARG;
 		item.kind = ATTRIBUTE_BLOB;
 		item.value.blob.size = value->caub.cElems;
 		item.value.blob.data = value->caub.pElems;
@@ -557,17 +568,32 @@ static HRESULT attr_delete(mf_object *object, REFGUID key)
 				memmove(&object->attributes[i], &object->attributes[i + 1],
 					(object->attribute_count - i - 1) * sizeof(attribute));
 			--object->attribute_count;
-			return S_OK;
+			break;
 		}
-	return MF_E_ATTRIBUTENOTFOUND;
+	return S_OK;
+}
+
+static HRESULT attr_delete_all(mf_object *object)
+{
+	while (object->attribute_count)
+		attribute_clear(&object->attributes[--object->attribute_count]);
+	return S_OK;
+}
+
+static HRESULT attr_get_count(mf_object *object, UINT32 *count)
+{
+	if (!count)
+		return E_POINTER;
+	*count = object->attribute_count;
+	return S_OK;
 }
 
 static HRESULT attr_get_index(mf_object *object, UINT32 index, GUID *key, PROPVARIANT *value)
 {
-	if (!key || !value)
+	if (!key)
 		return E_POINTER;
 	if (index >= object->attribute_count)
-		return MF_E_NO_MORE_TYPES;
+		return E_INVALIDARG;
 	*key = object->attributes[index].key;
 	return attribute_get_item(object, key, value);
 }
@@ -602,41 +628,67 @@ static ULONG object_release(mf_object *object)
 	for (DWORD i = 0; i < object->buffer_count; ++i)
 		IMFMediaBuffer_Release(object->buffers[i]);
 	LocalFree(object->buffers);
+	DeleteCriticalSection(&object->lock);
 	LocalFree(object);
 	return 0;
 }
 
+#define GUARDED(object_expr, call) \
+	{ mf_object *o = (object_expr); EnterCriticalSection(&o->lock); const HRESULT status = (call); LeaveCriticalSection(&o->lock); return status; }
+
+/* A call into another store runs on a copy of this one, with no lock held: two stores that name each other never wait for each other. */
+static HRESULT attr_snapshot(mf_object *object, mf_object *copy)
+{
+	HRESULT status = S_OK;
+	memset(copy, 0, sizeof(*copy));
+	EnterCriticalSection(&object->lock);
+	for (UINT32 i = 0; SUCCEEDED(status) && i < object->attribute_count; ++i)
+		status = attribute_store(copy, &object->attributes[i].key, &object->attributes[i]);
+	LeaveCriticalSection(&object->lock);
+	return status;
+}
+
+static void attr_snapshot_free(mf_object *copy)
+{
+	for (UINT32 i = 0; i < copy->attribute_count; ++i)
+		attribute_clear(&copy->attributes[i]);
+	LocalFree(copy->attributes);
+}
+
+#define SNAPSHOTTED(object_expr, call) \
+	{ mf_object copy, *o = &copy; HRESULT status = attr_snapshot((object_expr), o); if (SUCCEEDED(status)) status = (call); attr_snapshot_free(o); return status; }
+
 #define ATTRIBUTE_WRAPPERS(prefix, iface_type, object_expr) \
-static HRESULT WINAPI prefix##_GetItem(iface_type *self, REFGUID key, PROPVARIANT *value) { return attribute_get_item((object_expr), key, value); } \
-static HRESULT WINAPI prefix##_GetItemType(iface_type *self, REFGUID key, MF_ATTRIBUTE_TYPE *type) { return attr_get_item_type((object_expr), key, type); } \
-static HRESULT WINAPI prefix##_CompareItem(iface_type *self, REFGUID key, REFPROPVARIANT value, WINBOOL *result) { return attr_compare_item((object_expr), key, value, result); } \
-static HRESULT WINAPI prefix##_Compare(iface_type *self, IMFAttributes *theirs, MF_ATTRIBUTES_MATCH_TYPE mode, WINBOOL *result) { return attr_compare((object_expr), theirs, mode, result); } \
-static HRESULT WINAPI prefix##_GetUINT32(iface_type *self, REFGUID key, UINT32 *value) { return attribute_get_scalar((object_expr), key, ATTRIBUTE_U32, value); } \
-static HRESULT WINAPI prefix##_GetUINT64(iface_type *self, REFGUID key, UINT64 *value) { return attribute_get_scalar((object_expr), key, ATTRIBUTE_U64, value); } \
-static HRESULT WINAPI prefix##_GetDouble(iface_type *self, REFGUID key, double *value) { return attribute_get_scalar((object_expr), key, ATTRIBUTE_DOUBLE, value); } \
-static HRESULT WINAPI prefix##_GetGUID(iface_type *self, REFGUID key, GUID *value) { return attribute_get_scalar((object_expr), key, ATTRIBUTE_GUID, value); } \
-static HRESULT WINAPI prefix##_GetStringLength(iface_type *self, REFGUID key, UINT32 *length) { return attr_get_string_length((object_expr), key, length); } \
-static HRESULT WINAPI prefix##_GetString(iface_type *self, REFGUID key, LPWSTR value, UINT32 size, UINT32 *length) { return attr_get_string((object_expr), key, value, size, length); } \
-static HRESULT WINAPI prefix##_GetAllocatedString(iface_type *self, REFGUID key, LPWSTR *value, UINT32 *length) { return attr_get_allocated_string((object_expr), key, value, length); } \
-static HRESULT WINAPI prefix##_GetBlobSize(iface_type *self, REFGUID key, UINT32 *size) { return attr_get_blob_size((object_expr), key, size); } \
-static HRESULT WINAPI prefix##_GetBlob(iface_type *self, REFGUID key, UINT8 *value, UINT32 size, UINT32 *written) { return attr_get_blob((object_expr), key, value, size, written); } \
-static HRESULT WINAPI prefix##_GetAllocatedBlob(iface_type *self, REFGUID key, UINT8 **value, UINT32 *size) { return attr_get_allocated_blob((object_expr), key, value, size); } \
-static HRESULT WINAPI prefix##_GetUnknown(iface_type *self, REFGUID key, REFIID iid, LPVOID *value) { return attr_get_unknown((object_expr), key, iid, value); } \
-static HRESULT WINAPI prefix##_SetItem(iface_type *self, REFGUID key, REFPROPVARIANT value) { return attribute_from_variant((object_expr), key, value); } \
-static HRESULT WINAPI prefix##_DeleteItem(iface_type *self, REFGUID key) { return attr_delete((object_expr), key); } \
-static HRESULT WINAPI prefix##_DeleteAllItems(iface_type *self) { mf_object *o = (object_expr); while (o->attribute_count) attribute_clear(&o->attributes[--o->attribute_count]); return S_OK; } \
-static HRESULT WINAPI prefix##_SetUINT32(iface_type *self, REFGUID key, UINT32 value) { attribute item = {.kind = ATTRIBUTE_U32, .value.u32 = value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetUINT64(iface_type *self, REFGUID key, UINT64 value) { attribute item = {.kind = ATTRIBUTE_U64, .value.u64 = value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetDouble(iface_type *self, REFGUID key, double value) { attribute item = {.kind = ATTRIBUTE_DOUBLE, .value.real = value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetGUID(iface_type *self, REFGUID key, REFGUID value) { attribute item = {.kind = ATTRIBUTE_GUID, .value.guid = *value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetString(iface_type *self, REFGUID key, LPCWSTR value) { if (!value) return E_INVALIDARG; attribute item = {.kind = ATTRIBUTE_STRING, .value.string = (WCHAR *)value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetBlob(iface_type *self, REFGUID key, const UINT8 *value, UINT32 size) { if (size && !value) return E_INVALIDARG; attribute item = {.kind = ATTRIBUTE_BLOB, .value.blob = {size, (UINT8 *)value}}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_SetUnknown(iface_type *self, REFGUID key, IUnknown *value) { attribute item = {.kind = ATTRIBUTE_UNKNOWN, .value.unknown = value}; return attribute_store((object_expr), key, &item); } \
-static HRESULT WINAPI prefix##_LockStore(iface_type *self) { return S_OK; } \
-static HRESULT WINAPI prefix##_UnlockStore(iface_type *self) { return S_OK; } \
-static HRESULT WINAPI prefix##_GetCount(iface_type *self, UINT32 *count) { if (!count) return E_POINTER; *count = (object_expr)->attribute_count; return S_OK; } \
-static HRESULT WINAPI prefix##_GetItemByIndex(iface_type *self, UINT32 index, GUID *key, PROPVARIANT *value) { return attr_get_index((object_expr), index, key, value); } \
-static HRESULT WINAPI prefix##_CopyAllItems(iface_type *self, IMFAttributes *destination) { return attr_copy_all((object_expr), destination); }
+static HRESULT WINAPI prefix##_GetItem(iface_type *self, REFGUID key, PROPVARIANT *value) GUARDED((object_expr), attribute_get_item(o, key, value)) \
+static HRESULT WINAPI prefix##_GetItemType(iface_type *self, REFGUID key, MF_ATTRIBUTE_TYPE *type) GUARDED((object_expr), attr_get_item_type(o, key, type)) \
+static HRESULT WINAPI prefix##_CompareItem(iface_type *self, REFGUID key, REFPROPVARIANT value, WINBOOL *result) GUARDED((object_expr), attr_compare_item(o, key, value, result)) \
+static HRESULT WINAPI prefix##_Compare(iface_type *self, IMFAttributes *theirs, MF_ATTRIBUTES_MATCH_TYPE mode, WINBOOL *result) SNAPSHOTTED((object_expr), attr_compare(o, theirs, mode, result)) \
+static HRESULT WINAPI prefix##_GetUINT32(iface_type *self, REFGUID key, UINT32 *value) GUARDED((object_expr), attribute_get_scalar(o, key, ATTRIBUTE_U32, value)) \
+static HRESULT WINAPI prefix##_GetUINT64(iface_type *self, REFGUID key, UINT64 *value) GUARDED((object_expr), attribute_get_scalar(o, key, ATTRIBUTE_U64, value)) \
+static HRESULT WINAPI prefix##_GetDouble(iface_type *self, REFGUID key, double *value) GUARDED((object_expr), attribute_get_scalar(o, key, ATTRIBUTE_DOUBLE, value)) \
+static HRESULT WINAPI prefix##_GetGUID(iface_type *self, REFGUID key, GUID *value) GUARDED((object_expr), attribute_get_scalar(o, key, ATTRIBUTE_GUID, value)) \
+static HRESULT WINAPI prefix##_GetStringLength(iface_type *self, REFGUID key, UINT32 *length) GUARDED((object_expr), attr_get_string_length(o, key, length)) \
+static HRESULT WINAPI prefix##_GetString(iface_type *self, REFGUID key, LPWSTR value, UINT32 size, UINT32 *length) GUARDED((object_expr), attr_get_string(o, key, value, size, length)) \
+static HRESULT WINAPI prefix##_GetAllocatedString(iface_type *self, REFGUID key, LPWSTR *value, UINT32 *length) GUARDED((object_expr), attr_get_allocated_string(o, key, value, length)) \
+static HRESULT WINAPI prefix##_GetBlobSize(iface_type *self, REFGUID key, UINT32 *size) GUARDED((object_expr), attr_get_blob_size(o, key, size)) \
+static HRESULT WINAPI prefix##_GetBlob(iface_type *self, REFGUID key, UINT8 *value, UINT32 size, UINT32 *written) GUARDED((object_expr), attr_get_blob(o, key, value, size, written)) \
+static HRESULT WINAPI prefix##_GetAllocatedBlob(iface_type *self, REFGUID key, UINT8 **value, UINT32 *size) GUARDED((object_expr), attr_get_allocated_blob(o, key, value, size)) \
+static HRESULT WINAPI prefix##_GetUnknown(iface_type *self, REFGUID key, REFIID iid, LPVOID *value) GUARDED((object_expr), attr_get_unknown(o, key, iid, value)) \
+static HRESULT WINAPI prefix##_SetItem(iface_type *self, REFGUID key, REFPROPVARIANT value) GUARDED((object_expr), attribute_from_variant(o, key, value)) \
+static HRESULT WINAPI prefix##_DeleteItem(iface_type *self, REFGUID key) GUARDED((object_expr), attr_delete(o, key)) \
+static HRESULT WINAPI prefix##_DeleteAllItems(iface_type *self) GUARDED((object_expr), attr_delete_all(o)) \
+static HRESULT WINAPI prefix##_SetUINT32(iface_type *self, REFGUID key, UINT32 value) { attribute item = {.kind = ATTRIBUTE_U32, .value.u32 = value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetUINT64(iface_type *self, REFGUID key, UINT64 value) { attribute item = {.kind = ATTRIBUTE_U64, .value.u64 = value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetDouble(iface_type *self, REFGUID key, double value) { attribute item = {.kind = ATTRIBUTE_DOUBLE, .value.real = value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetGUID(iface_type *self, REFGUID key, REFGUID value) { attribute item = {.kind = ATTRIBUTE_GUID, .value.guid = *value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetString(iface_type *self, REFGUID key, LPCWSTR value) { if (!value) return E_INVALIDARG; attribute item = {.kind = ATTRIBUTE_STRING, .value.string = (WCHAR *)value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetBlob(iface_type *self, REFGUID key, const UINT8 *value, UINT32 size) { if (size && !value) return E_INVALIDARG; attribute item = {.kind = ATTRIBUTE_BLOB, .value.blob = {size, (UINT8 *)value}}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_SetUnknown(iface_type *self, REFGUID key, IUnknown *value) { attribute item = {.kind = ATTRIBUTE_UNKNOWN, .value.unknown = value}; GUARDED((object_expr), attribute_store(o, key, &item)) } \
+static HRESULT WINAPI prefix##_LockStore(iface_type *self) { EnterCriticalSection(&(object_expr)->lock); return S_OK; } \
+static HRESULT WINAPI prefix##_UnlockStore(iface_type *self) { LeaveCriticalSection(&(object_expr)->lock); return S_OK; } \
+static HRESULT WINAPI prefix##_GetCount(iface_type *self, UINT32 *count) GUARDED((object_expr), attr_get_count(o, count)) \
+static HRESULT WINAPI prefix##_GetItemByIndex(iface_type *self, UINT32 index, GUID *key, PROPVARIANT *value) GUARDED((object_expr), attr_get_index(o, index, key, value)) \
+static HRESULT WINAPI prefix##_CopyAllItems(iface_type *self, IMFAttributes *destination) SNAPSHOTTED((object_expr), attr_copy_all(o, destination))
 
 ATTRIBUTE_WRAPPERS(type, IMFMediaType, object_from_type(self))
 ATTRIBUTE_WRAPPERS(sample, IMFSample, object_from_sample(self))
@@ -693,16 +745,38 @@ static HRESULT WINAPI type_GetRepresentation(IMFMediaType *self, GUID representa
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	if (!guid_equal(&representation, &format_wave_format_ex))
-		return E_NOTIMPL;
+	if (!guid_equal(&representation, &format_wave_format_ex) && !guid_equal(&representation, &AM_MEDIA_TYPE_REPRESENTATION))
+		return MF_E_UNSUPPORTED_REPRESENTATION;
+	AM_MEDIA_TYPE *media = CoTaskMemAlloc(sizeof(*media));
+	if (!media)
+		return E_OUTOFMEMORY;
+	memset(media, 0, sizeof(*media));
+	WAVEFORMATEX *format;
 	UINT32 size;
-	return MFCreateWaveFormatExFromMFMediaType(self, (WAVEFORMATEX **)out, &size, MFWaveFormatExConvertFlag_Normal);
+	HRESULT status = MFCreateWaveFormatExFromMFMediaType(self, &format, &size, MFWaveFormatExConvertFlag_Normal);
+	if (SUCCEEDED(status))
+		status = type_GetGUID(self, &MF_MT_SUBTYPE, &media->subtype);
+	if (FAILED(status)) {
+		CoTaskMemFree(format);
+		CoTaskMemFree(media);
+		return status;
+	}
+	media->majortype = MFMediaType_Audio;
+	media->bFixedSizeSamples = TRUE;
+	media->lSampleSize = format->nBlockAlign;
+	media->formattype = format_wave_format_ex;
+	media->cbFormat = size;
+	media->pbFormat = (BYTE *)format;
+	*out = media;
+	return S_OK;
 }
 
 static HRESULT WINAPI type_FreeRepresentation(IMFMediaType *self, GUID representation, LPVOID value)
 {
 	(void)self;
 	(void)representation;
+	if (value)
+		CoTaskMemFree(((AM_MEDIA_TYPE *)value)->pbFormat);
 	CoTaskMemFree(value);
 	return S_OK;
 }
@@ -744,16 +818,20 @@ static HRESULT WINAPI sample_GetSampleTime(IMFSample *self, LONGLONG *time)
 	if (!time)
 		return E_POINTER;
 	mf_object *object = object_from_sample(self);
-	if (!object->has_sample_time)
-		return MF_E_NO_SAMPLE_TIMESTAMP;
-	*time = object->sample_time;
-	return S_OK;
+	EnterCriticalSection(&object->lock);
+	const BOOL known = object->has_sample_time;
+	if (known)
+		*time = object->sample_time;
+	LeaveCriticalSection(&object->lock);
+	return known ? S_OK : MF_E_NO_SAMPLE_TIMESTAMP;
 }
 static HRESULT WINAPI sample_SetSampleTime(IMFSample *self, LONGLONG time)
 {
 	mf_object *object = object_from_sample(self);
+	EnterCriticalSection(&object->lock);
 	object->sample_time = time;
 	object->has_sample_time = TRUE;
+	LeaveCriticalSection(&object->lock);
 	return S_OK;
 }
 static HRESULT WINAPI sample_GetSampleDuration(IMFSample *self, LONGLONG *duration)
@@ -761,16 +839,20 @@ static HRESULT WINAPI sample_GetSampleDuration(IMFSample *self, LONGLONG *durati
 	if (!duration)
 		return E_POINTER;
 	mf_object *object = object_from_sample(self);
-	if (!object->has_sample_duration)
-		return MF_E_NO_SAMPLE_DURATION;
-	*duration = object->sample_duration;
-	return S_OK;
+	EnterCriticalSection(&object->lock);
+	const BOOL known = object->has_sample_duration;
+	if (known)
+		*duration = object->sample_duration;
+	LeaveCriticalSection(&object->lock);
+	return known ? S_OK : MF_E_NO_SAMPLE_DURATION;
 }
 static HRESULT WINAPI sample_SetSampleDuration(IMFSample *self, LONGLONG duration)
 {
 	mf_object *object = object_from_sample(self);
+	EnterCriticalSection(&object->lock);
 	object->sample_duration = duration;
 	object->has_sample_duration = TRUE;
+	LeaveCriticalSection(&object->lock);
 	return S_OK;
 }
 static HRESULT WINAPI sample_GetBufferCount(IMFSample *self, DWORD *count)
@@ -780,23 +862,18 @@ static HRESULT WINAPI sample_GetBufferCount(IMFSample *self, DWORD *count)
 	*count = object_from_sample(self)->buffer_count;
 	return S_OK;
 }
-static HRESULT WINAPI sample_GetBufferByIndex(IMFSample *self, DWORD index, IMFMediaBuffer **buffer)
+
+static HRESULT buffers_get(mf_object *object, DWORD index, IMFMediaBuffer **buffer)
 {
-	if (!buffer)
-		return E_POINTER;
-	*buffer = NULL;
-	mf_object *object = object_from_sample(self);
 	if (index >= object->buffer_count)
 		return MF_E_INVALIDINDEX;
 	*buffer = object->buffers[index];
 	IMFMediaBuffer_AddRef(*buffer);
 	return S_OK;
 }
-static HRESULT WINAPI sample_AddBuffer(IMFSample *self, IMFMediaBuffer *buffer)
+
+static HRESULT buffers_add(mf_object *object, IMFMediaBuffer *buffer)
 {
-	if (!buffer)
-		return E_POINTER;
-	mf_object *object = object_from_sample(self);
 	if (object->buffer_count == object->buffer_capacity) {
 		const DWORD capacity = object->buffer_capacity ? object->buffer_capacity * 2 : 4;
 		if (capacity < object->buffer_capacity || capacity > SIZE_MAX / sizeof(*object->buffers))
@@ -814,9 +891,9 @@ static HRESULT WINAPI sample_AddBuffer(IMFSample *self, IMFMediaBuffer *buffer)
 	object->buffers[object->buffer_count++] = buffer;
 	return S_OK;
 }
-static HRESULT WINAPI sample_RemoveBufferByIndex(IMFSample *self, DWORD index)
+
+static HRESULT buffers_remove(mf_object *object, DWORD index)
 {
-	mf_object *object = object_from_sample(self);
 	if (index >= object->buffer_count)
 		return MF_E_INVALIDINDEX;
 	IMFMediaBuffer_Release(object->buffers[index]);
@@ -825,21 +902,19 @@ static HRESULT WINAPI sample_RemoveBufferByIndex(IMFSample *self, DWORD index)
 	--object->buffer_count;
 	return S_OK;
 }
-static HRESULT WINAPI sample_RemoveAllBuffers(IMFSample *self)
+
+static HRESULT buffers_remove_all(mf_object *object)
 {
-	mf_object *object = object_from_sample(self);
 	while (object->buffer_count) {
 		const DWORD index = --object->buffer_count;
 		IMFMediaBuffer_Release(object->buffers[index]);
 	}
 	return S_OK;
 }
-static HRESULT WINAPI sample_GetTotalLength(IMFSample *self, DWORD *length)
+
+static HRESULT buffers_total_length(mf_object *object, DWORD *length)
 {
-	if (!length)
-		return E_POINTER;
 	*length = 0;
-	mf_object *object = object_from_sample(self);
 	for (DWORD i = 0; i < object->buffer_count; ++i) {
 		DWORD current;
 		const HRESULT status = IMFMediaBuffer_GetCurrentLength(object->buffers[i], &current);
@@ -851,18 +926,15 @@ static HRESULT WINAPI sample_GetTotalLength(IMFSample *self, DWORD *length)
 	}
 	return S_OK;
 }
-static HRESULT WINAPI sample_ConvertToContiguousBuffer(IMFSample *self, IMFMediaBuffer **out);
-static HRESULT WINAPI sample_CopyToBuffer(IMFSample *self, IMFMediaBuffer *destination)
+
+static HRESULT buffers_copy(mf_object *object, IMFMediaBuffer *destination)
 {
-	if (!destination)
-		return E_POINTER;
 	BYTE *target;
 	DWORD target_max, target_length;
 	HRESULT status = IMFMediaBuffer_Lock(destination, &target, &target_max, &target_length);
 	if (FAILED(status))
 		return status;
 	DWORD offset = 0;
-	mf_object *object = object_from_sample(self);
 	for (DWORD i = 0; i < object->buffer_count && SUCCEEDED(status); ++i) {
 		BYTE *source;
 		DWORD max_length, current;
@@ -884,6 +956,43 @@ static HRESULT WINAPI sample_CopyToBuffer(IMFSample *self, IMFMediaBuffer *desti
 		status = IMFMediaBuffer_SetCurrentLength(destination, offset);
 	const HRESULT unlock = IMFMediaBuffer_Unlock(destination);
 	return FAILED(status) ? status : unlock;
+}
+
+static HRESULT buffers_contiguous(mf_object *object, IMFMediaBuffer **out);
+
+static HRESULT WINAPI sample_GetBufferByIndex(IMFSample *self, DWORD index, IMFMediaBuffer **buffer)
+{
+	if (!buffer)
+		return E_POINTER;
+	*buffer = NULL;
+	GUARDED(object_from_sample(self), buffers_get(o, index, buffer))
+}
+static HRESULT WINAPI sample_ConvertToContiguousBuffer(IMFSample *self, IMFMediaBuffer **out)
+{
+	if (!out)
+		return E_POINTER;
+	*out = NULL;
+	GUARDED(object_from_sample(self), buffers_contiguous(o, out))
+}
+static HRESULT WINAPI sample_AddBuffer(IMFSample *self, IMFMediaBuffer *buffer)
+{
+	if (!buffer)
+		return E_POINTER;
+	GUARDED(object_from_sample(self), buffers_add(o, buffer))
+}
+static HRESULT WINAPI sample_RemoveBufferByIndex(IMFSample *self, DWORD index) GUARDED(object_from_sample(self), buffers_remove(o, index))
+static HRESULT WINAPI sample_RemoveAllBuffers(IMFSample *self) GUARDED(object_from_sample(self), buffers_remove_all(o))
+static HRESULT WINAPI sample_GetTotalLength(IMFSample *self, DWORD *length)
+{
+	if (!length)
+		return E_POINTER;
+	GUARDED(object_from_sample(self), buffers_total_length(o, length))
+}
+static HRESULT WINAPI sample_CopyToBuffer(IMFSample *self, IMFMediaBuffer *destination)
+{
+	if (!destination)
+		return E_POINTER;
+	GUARDED(object_from_sample(self), buffers_copy(o, destination))
 }
 
 static IMFSampleVtbl sample_vtable = {
@@ -998,7 +1107,7 @@ static HRESULT create_buffer(DWORD max_length, DWORD alignment, IMFMediaBuffer *
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	if (alignment && ((alignment & (alignment - 1)) || alignment > 4096))
+	if ((alignment & (alignment - 1)) || alignment > 4096)
 		return E_INVALIDARG;
 	media_buffer *buffer = LocalAlloc(LPTR, sizeof(*buffer));
 	if (!buffer)
@@ -1007,7 +1116,7 @@ static HRESULT create_buffer(DWORD max_length, DWORD alignment, IMFMediaBuffer *
 	buffer->ref = 1;
 	buffer->max_length = max_length;
 	if (max_length) {
-		const DWORD align = alignment ? alignment : 1;
+		const DWORD align = alignment;
 		if (max_length > UINT32_MAX - align + 1) {
 			LocalFree(buffer);
 			return E_INVALIDARG;
@@ -1023,34 +1132,24 @@ static HRESULT create_buffer(DWORD max_length, DWORD alignment, IMFMediaBuffer *
 	return S_OK;
 }
 
-static HRESULT WINAPI sample_ConvertToContiguousBuffer(IMFSample *self, IMFMediaBuffer **out)
+static HRESULT buffers_contiguous(mf_object *object, IMFMediaBuffer **out)
 {
-	if (!out)
-		return E_POINTER;
-	*out = NULL;
-	mf_object *object = object_from_sample(self);
 	if (!object->buffer_count)
 		return E_UNEXPECTED;
-	if (object->buffer_count == 1) {
-		*out = object->buffers[0];
-		IMFMediaBuffer_AddRef(*out);
-		return S_OK;
-	}
+	if (object->buffer_count == 1)
+		return buffers_get(object, 0, out);
 	DWORD total;
-	HRESULT status = sample_GetTotalLength(self, &total);
+	HRESULT status = buffers_total_length(object, &total);
 	if (FAILED(status))
 		return status;
-	status = create_buffer(total, 0, out);
+	status = create_buffer(total, 1, out);
 	if (FAILED(status))
 		return status;
-	status = sample_CopyToBuffer(self, *out);
-	if (FAILED(status)) {
-		IMFMediaBuffer_Release(*out);
-		*out = NULL;
-		return status;
+	status = buffers_copy(object, *out);
+	if (SUCCEEDED(status)) {
+		buffers_remove_all(object);
+		status = buffers_add(object, *out);
 	}
-	sample_RemoveAllBuffers(self);
-	status = sample_AddBuffer(self, *out);
 	if (FAILED(status)) {
 		IMFMediaBuffer_Release(*out);
 		*out = NULL;
@@ -1058,16 +1157,25 @@ static HRESULT WINAPI sample_ConvertToContiguousBuffer(IMFSample *self, IMFMedia
 	return status;
 }
 
+static mf_object *create_object(void)
+{
+	mf_object *object = LocalAlloc(LPTR, sizeof(*object));
+	if (object) {
+		object->ref = 1;
+		InitializeCriticalSection(&object->lock);
+	}
+	return object;
+}
+
 __declspec(dllexport) HRESULT WINAPI MFCreateSample(IMFSample **sample)
 {
 	if (!sample)
 		return E_POINTER;
 	*sample = NULL;
-	mf_object *object = LocalAlloc(LPTR, sizeof(*object));
+	mf_object *object = create_object();
 	if (!object)
 		return E_OUTOFMEMORY;
 	object->sample.lpVtbl = &sample_vtable;
-	object->ref = 1;
 	*sample = &object->sample;
 	return S_OK;
 }
@@ -1077,23 +1185,23 @@ __declspec(dllexport) HRESULT WINAPI MFCreateMediaType(IMFMediaType **type)
 	if (!type)
 		return E_POINTER;
 	*type = NULL;
-	mf_object *object = LocalAlloc(LPTR, sizeof(*object));
+	mf_object *object = create_object();
 	if (!object)
 		return E_OUTOFMEMORY;
 	object->media_type.lpVtbl = &media_type_vtable;
-	object->ref = 1;
 	*type = &object->media_type;
 	return S_OK;
 }
 
 __declspec(dllexport) HRESULT WINAPI MFCreateMemoryBuffer(DWORD max_length, IMFMediaBuffer **buffer)
 {
-	return create_buffer(max_length, 0, buffer);
+	return create_buffer(max_length, 1, buffer);
 }
 
 __declspec(dllexport) HRESULT WINAPI MFCreateAlignedMemoryBuffer(DWORD max_length, DWORD alignment, IMFMediaBuffer **buffer)
 {
-	return create_buffer(max_length, alignment, buffer);
+	/* The argument is a mask such as MF_16_BYTE_ALIGNMENT, one less than the alignment. */
+	return alignment == UINT32_MAX ? E_INVALIDARG : create_buffer(max_length, alignment + 1, buffer);
 }
 
 __declspec(dllexport) HRESULT WINAPI MFInitMediaTypeFromWaveFormatEx(IMFMediaType *type, const WAVEFORMATEX *format, UINT32 size)
@@ -1141,26 +1249,18 @@ __declspec(dllexport) HRESULT WINAPI MFInitMediaTypeFromWaveFormatEx(IMFMediaTyp
 		return status;
 	if (format->cbSize && !extensible)
 		status = IMFMediaType_SetBlob(type, &MF_MT_USER_DATA, (const UINT8 *)(format + 1), format->cbSize);
-	else {
+	else
 		status = IMFMediaType_DeleteItem(type, &MF_MT_USER_DATA);
-		if (status == MF_E_ATTRIBUTENOTFOUND)
-			status = S_OK;
-	}
-	if (SUCCEEDED(status) && !extensible) {
-		HRESULT cleanup = IMFMediaType_DeleteItem(type, &MF_MT_AUDIO_CHANNEL_MASK);
-		if (cleanup != MF_E_ATTRIBUTENOTFOUND && FAILED(cleanup))
-			return cleanup;
-		cleanup = IMFMediaType_DeleteItem(type, &MF_MT_AUDIO_VALID_BITS_PER_SAMPLE);
-		if (cleanup != MF_E_ATTRIBUTENOTFOUND && FAILED(cleanup))
-			return cleanup;
-	}
+	if (SUCCEEDED(status) && !extensible)
+		status = IMFMediaType_DeleteItem(type, &MF_MT_AUDIO_CHANNEL_MASK);
+	if (SUCCEEDED(status) && !extensible)
+		status = IMFMediaType_DeleteItem(type, &MF_MT_AUDIO_VALID_BITS_PER_SAMPLE);
 	return status;
 }
 
 __declspec(dllexport) HRESULT WINAPI MFCreateWaveFormatExFromMFMediaType(IMFMediaType *type, WAVEFORMATEX **format,
 	UINT32 *size, UINT32 flags)
 {
-	(void)flags;
 	if (!type || !format || !size)
 		return E_POINTER;
 	*format = NULL;
@@ -1178,7 +1278,6 @@ __declspec(dllexport) HRESULT WINAPI MFCreateWaveFormatExFromMFMediaType(IMFMedi
 	const UINT32 sample_bytes = (bits + 7) / 8;
 	if (!sample_bytes || channels > UINT32_MAX / sample_bytes)
 		return MF_E_INVALIDMEDIATYPE;
-	alignment = channels * sample_bytes;
 	if (FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &alignment)))
 		alignment = channels * sample_bytes;
 	if (!alignment || rate > UINT32_MAX / alignment)
@@ -1208,6 +1307,14 @@ __declspec(dllexport) HRESULT WINAPI MFCreateWaveFormatExFromMFMediaType(IMFMedi
 		CoTaskMemFree(user_data);
 		return MF_E_INVALIDMEDIATYPE;
 	}
+	UINT32 valid_bits = bits, channel_mask = channels == 1 ? SPEAKER_FRONT_CENTER : channels < 32 ? (1u << channels) - 1 : 0;
+	IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_VALID_BITS_PER_SAMPLE, &valid_bits);
+	IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_CHANNEL_MASK, &channel_mask);
+	/* A plain WAVEFORMATEX cannot say where more than two channels go or that some sample bits are padding. */
+	const BOOL extensible = !guid_equal(&subtype, &subtype_adpcm) &&
+		(flags == MFWaveFormatExConvertFlag_ForceExtensible || channels > 2 || valid_bits != bits);
+	if (extensible)
+		extra = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
 	const DWORD cb = (DWORD)sizeof(WAVEFORMATEX) + extra;
 	WAVEFORMATEX *result = CoTaskMemAlloc(cb);
 	if (!result) {
@@ -1229,7 +1336,13 @@ __declspec(dllexport) HRESULT WINAPI MFCreateWaveFormatExFromMFMediaType(IMFMedi
 	result->nBlockAlign = (WORD)alignment;
 	result->nAvgBytesPerSec = average;
 	result->cbSize = (WORD)extra;
-	if (extra)
+	if (extensible) {
+		WAVEFORMATEXTENSIBLE *extended = (WAVEFORMATEXTENSIBLE *)result;
+		result->wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+		extended->Samples.wValidBitsPerSample = (WORD)valid_bits;
+		extended->dwChannelMask = channel_mask;
+		extended->SubFormat = subtype;
+	} else if (extra)
 		memcpy(result + 1, user_data, extra);
 	CoTaskMemFree(user_data);
 	*format = result;

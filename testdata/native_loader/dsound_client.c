@@ -3,7 +3,10 @@
 #define COBJMACROS
 #include <windows.h>
 #include <mmsystem.h>
+#include <mmreg.h>
 #include <dsound.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <stddef.h>
 
 /* dsound.dll, the guest DirectSound, on the device that plays to nowhere in real time (RAVEN_AUDIO=null):
@@ -206,6 +209,28 @@ static int controls(void)
 	primary = make(sound, DSBCAPS_PRIMARYBUFFER, 0, NULL, &result);
 	if (result != DS_OK || IDirectSoundBuffer_SetVolume(primary, 0) != DSERR_CONTROLUNAVAIL || IDirectSoundBuffer_Release(primary) != 0)
 		return 229;
+	/* An extensible format reports its own 22 extra bytes whatever size the program claimed for it. */
+	static union {
+		WAVEFORMATEXTENSIBLE extensible;
+		BYTE bytes[sizeof(WAVEFORMATEX) + 1022];
+	} wide;
+	wide.extensible.Format = pcm(22050, 1, 8);
+	wide.extensible.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+	wide.extensible.Format.cbSize = 1022;
+	wide.extensible.Samples.wValidBitsPerSample = 8;
+	wide.extensible.dwChannelMask = SPEAKER_FRONT_CENTER;
+	wide.extensible.SubFormat = (GUID){0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+	IDirectSoundBuffer *quiet = make(sound, 0, 4096, &wide.extensible.Format, &result);
+	WAVEFORMATEXTENSIBLE reported = {0};
+	DWORD reported_bytes = 0;
+	if (result != DS_OK || IDirectSoundBuffer_GetFormat(quiet, NULL, 0, &reported_bytes) != DS_OK || reported_bytes != sizeof(reported) ||
+		IDirectSoundBuffer_GetFormat(quiet, &reported.Format, sizeof(reported), NULL) != DS_OK || reported.Format.cbSize != 22)
+		return 230;
+	/* An 8-bit buffer nobody wrote holds silence, which is 0x80. */
+	if (IDirectSoundBuffer_Lock(quiet, 0, 0, &first, &first_bytes, NULL, NULL, DSBLOCK_ENTIREBUFFER) != DS_OK || first_bytes != 4096 ||
+		((BYTE *)first)[0] != 0x80 || ((BYTE *)first)[4095] != 0x80 || IDirectSoundBuffer_Unlock(quiet, first, first_bytes, NULL, 0) != DS_OK ||
+		IDirectSoundBuffer_Release(quiet) != 0)
+		return 231;
 	if (IDirectSound8_Release(sound) != 0)
 		return 226;
 	return 0;
@@ -259,6 +284,8 @@ static int playback(void)
 		stopped = CreateEventW(NULL, FALSE, FALSE, NULL);
 	DSBPOSITIONNOTIFY positions[] = {{0, zero}, {size / 4, quarter}, {DSBPN_OFFSETSTOP, stopped}};
 	DSBPOSITIONNOTIFY wrong = {size, quarter};
+	if (IDirectSoundNotify_SetNotificationPositions(notify, DSBNOTIFICATIONS_MAX + 1, &wrong) != DSERR_INVALIDPARAM)
+		return 332;
 	if (IDirectSoundNotify_SetNotificationPositions(notify, 1, &wrong) != DSERR_INVALIDPARAM)
 		return 309;
 	if (IDirectSoundNotify_SetNotificationPositions(notify, 3, positions) != DS_OK)

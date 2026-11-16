@@ -25,13 +25,6 @@
 #define ALLOC(size) LocalAlloc(LPTR, (size))
 #define FREE(block) LocalFree(block)
 
-__declspec(dllimport) HANDLE WINAPI RavenAudioOpen(const WAVEFORMATEX *format, DWORD flags, DWORD buffer_frames, DWORD period_frames,
-	HANDLE event, RavenAudioShared **shared);
-__declspec(dllimport) BOOL WINAPI RavenAudioStart(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioStop(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioReset(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioClose(HANDLE stream);
-
 /* The device's stream: float stereo at 48 kHz, a 10 ms period, and a 100 ms ring of which the mixer keeps LEAD_PERIODS filled ahead of
  * the device. */
 #define MIX_RATE 48000u
@@ -47,8 +40,6 @@ static const GUID subtype_float = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00
 static const GUID render_guid = {0x5a1d0e01, 0x7a3c, 0x4b8e, {0x9a, 0x52, 0x52, 0x41, 0x56, 0x45, 0x4e, 0x01}};
 static const GUID capture_guid = {0x5a1d0e02, 0x7a3c, 0x4b8e, {0x9a, 0x52, 0x52, 0x41, 0x56, 0x45, 0x4e, 0x02}};
 
-static inline UINT64 load64(const UINT64 *field) { return __atomic_load_n(field, __ATOMIC_ACQUIRE); }
-static inline void store64(UINT64 *field, UINT64 value) { __atomic_store_n(field, value, __ATOMIC_RELEASE); }
 static inline BOOL same_guid(const GUID *first, const GUID *second) { return !memcmp(first, second, sizeof(GUID)); }
 
 /* Every object of the component is guarded by this one lock, which the mixer and capture threads take for each period. */
@@ -163,6 +154,7 @@ void buffer_reset_primary(buffer *buffer);
 buffer *buffer_from(IDirectSoundBuffer *iface);
 void buffer_update_3d(buffer *buffer);
 HRESULT format_check(const WAVEFORMATEX *format, buffer_data *data);
+HRESULT format_copy(const WAVEFORMATEX *format, WAVEFORMATEX *out, DWORD size, DWORD *written);
 HRESULT notify_set(notify_list *list, DWORD size, DWORD count, const DSBPOSITIONNOTIFY *items);
 void notify_range(const notify_list *list, DWORD from, DWORD to, DWORD size);
 void notify_stop(const notify_list *list);

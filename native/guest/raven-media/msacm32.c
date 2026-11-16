@@ -12,7 +12,6 @@
 
 typedef struct acm_stream {
 	WAVEFORMATEX source, destination;
-	DWORD source_size, destination_size;
 	DWORD source_align, destination_align;
 	DWORD source_frames_per_block, destination_frames_per_block;
 	ADPCMCOEFSET source_coefficients[32], destination_coefficients[32];
@@ -52,24 +51,21 @@ static BOOL adpcm_format(const WAVEFORMATEX *format, WORD *samples_per_block, WO
 	return TRUE;
 }
 
-static BOOL supported_pair(const WAVEFORMATEX *source, const WAVEFORMATEX *destination)
-{
-	WORD samples, count;
-	ADPCMCOEFSET coefficients[32];
-	if (pcm_format(source) && pcm_format(destination))
-		return source->nChannels == destination->nChannels && source->nSamplesPerSec == destination->nSamplesPerSec;
-	if (adpcm_format(source, &samples, &count, coefficients) && pcm_format(destination))
-		return source->nChannels == destination->nChannels && source->nSamplesPerSec == destination->nSamplesPerSec;
-	if (pcm_format(source) && adpcm_format(destination, &samples, &count, coefficients))
-		return source->nChannels == destination->nChannels && source->nSamplesPerSec == destination->nSamplesPerSec;
-	return FALSE;
-}
-
 static BOOL supported_format(const WAVEFORMATEX *format)
 {
 	WORD samples, count;
 	ADPCMCOEFSET coefficients[32];
 	return pcm_format(format) || adpcm_format(format, &samples, &count, coefficients);
+}
+
+static BOOL supported_pair(const WAVEFORMATEX *source, const WAVEFORMATEX *destination)
+{
+	WORD samples, count;
+	ADPCMCOEFSET coefficients[32];
+	/* shortcut: no resampling or channel conversion, add them when a program converts between rates or channel counts. */
+	return source->nChannels == destination->nChannels && source->nSamplesPerSec == destination->nSamplesPerSec &&
+		(pcm_format(source) ? supported_format(destination) :
+			adpcm_format(source, &samples, &count, coefficients) && pcm_format(destination));
 }
 
 static DWORD format_bytes(const WAVEFORMATEX *format)
@@ -83,8 +79,6 @@ static BOOL init_stream(acm_stream *stream, const WAVEFORMATEX *source, const WA
 		return FALSE;
 	memcpy(&stream->source, source, sizeof(WAVEFORMATEX));
 	memcpy(&stream->destination, destination, sizeof(WAVEFORMATEX));
-	stream->source_size = format_bytes(source);
-	stream->destination_size = format_bytes(destination);
 	stream->source_align = source->nBlockAlign;
 	stream->destination_align = destination->nBlockAlign;
 	stream->source_frames_per_block = 1;
@@ -102,6 +96,13 @@ static BOOL init_stream(acm_stream *stream, const WAVEFORMATEX *source, const WA
 		stream->destination_frames_per_block = frames;
 	}
 	return TRUE;
+}
+
+/* The bound keeps the next multiplication in range for a block that starts with a huge delta. */
+static LONG adapt_delta(int code, LONG delta)
+{
+	delta = adaptation[code] * delta / 256;
+	return delta < 16 ? 16 : delta > INT32_MAX / 768 ? INT32_MAX / 768 : delta;
 }
 
 static LONG clamp_sample(LONG sample)
@@ -185,9 +186,7 @@ static DWORD decode_adpcm_block(const acm_stream *stream, const BYTE *block, BYT
 			sample = clamp_sample(sample);
 			previous2[channel] = previous[channel];
 			previous[channel] = sample;
-			delta[channel] = adaptation[code] * delta[channel] / 256;
-			if (delta[channel] < 16)
-				delta[channel] = 16;
+			delta[channel] = adapt_delta(code, delta[channel]);
 			write_sample(output + frame * stream->destination.nBlockAlign + channel * sample_bytes,
 				stream->destination.wBitsPerSample, (SHORT)sample);
 			if (channels == 1)
@@ -233,9 +232,7 @@ static BYTE encode_nibble(const acm_stream *stream, DWORD channel, SHORT target,
 	LONG sample = clamp_sample(predicted + quantized * delta[channel]);
 	previous2[channel] = previous[channel];
 	previous[channel] = sample;
-	delta[channel] = adaptation[code] * delta[channel] / 256;
-	if (delta[channel] < 16)
-		delta[channel] = 16;
+	delta[channel] = adapt_delta(code, delta[channel]);
 	return (BYTE)code;
 }
 
@@ -299,9 +296,10 @@ static DWORD encode_adpcm_block(const acm_stream *stream, const BYTE *input, BYT
 
 static DWORD stream_convert(acm_stream *stream, ACMSTREAMHEADER *header, DWORD flags)
 {
-	if (!header || header->cbStruct < sizeof(*header) || !(header->fdwStatus & ACMSTREAMHEADER_STATUSF_PREPARED) ||
-		!header->pbSrc || !header->pbDst)
+	if (!header || header->cbStruct < sizeof(*header) || !header->pbSrc || !header->pbDst)
 		return MMSYSERR_INVALPARAM;
+	if (!(header->fdwStatus & ACMSTREAMHEADER_STATUSF_PREPARED))
+		return ACMERR_UNPREPARED;
 	if (header->fdwStatus & ACMSTREAMHEADER_STATUSF_INQUEUE)
 		return ACMERR_BUSY;
 	header->cbSrcLengthUsed = 0;
@@ -338,6 +336,7 @@ static DWORD stream_convert(acm_stream *stream, ACMSTREAMHEADER *header, DWORD f
 		header->cbSrcLengthUsed = source_offset;
 		header->cbDstLengthUsed = destination_offset;
 	}
+	/* shortcut: BLOCKALIGN, START and END are ignored because every call converts whole blocks and keeps no state. */
 	(void)flags;
 	header->fdwStatus |= ACMSTREAMHEADER_STATUSF_DONE;
 	return MMSYSERR_NOERROR;
@@ -437,7 +436,7 @@ static void copy_ascii_w(WCHAR *target, DWORD target_count, const char *source)
 	target[i] = 0;
 }
 
-#define DEFINE_TAG_DETAILS(suffix, type, copy_fn) \
+#define DEFINE_TAG_DETAILS(suffix, copy_fn) \
 __declspec(dllexport) MMRESULT WINAPI acmFormatTagDetails##suffix(HACMDRIVER driver, LPACMFORMATTAGDETAILS##suffix details, DWORD flags) \
 { \
 	(void)driver; \
@@ -452,8 +451,8 @@ __declspec(dllexport) MMRESULT WINAPI acmFormatTagDetails##suffix(HACMDRIVER dri
 	return MMSYSERR_NOERROR; \
 }
 
-DEFINE_TAG_DETAILS(A, A, copy_ascii_a)
-DEFINE_TAG_DETAILS(W, W, copy_ascii_w)
+DEFINE_TAG_DETAILS(A, copy_ascii_a)
+DEFINE_TAG_DETAILS(W, copy_ascii_w)
 
 static BOOL build_adpcm_format(LPWAVEFORMATEX output, DWORD capacity, DWORD channels, DWORD rate)
 {
@@ -510,7 +509,7 @@ static BOOL standard_format(DWORD tag, DWORD index, LPWAVEFORMATEX format, DWORD
 	return FALSE;
 }
 
-#define DEFINE_FORMAT_DETAILS(suffix, type, copy_fn) \
+#define DEFINE_FORMAT_DETAILS(suffix, copy_fn) \
 __declspec(dllexport) MMRESULT WINAPI acmFormatDetails##suffix(HACMDRIVER driver, LPACMFORMATDETAILS##suffix details, DWORD flags) \
 { \
 	(void)driver; \
@@ -544,46 +543,33 @@ __declspec(dllexport) MMRESULT WINAPI acmFormatDetails##suffix(HACMDRIVER driver
 	return MMSYSERR_NOERROR; \
 }
 
-DEFINE_FORMAT_DETAILS(A, A, copy_ascii_a)
-DEFINE_FORMAT_DETAILS(W, W, copy_ascii_w)
+DEFINE_FORMAT_DETAILS(A, copy_ascii_a)
+DEFINE_FORMAT_DETAILS(W, copy_ascii_w)
 
-__declspec(dllexport) MMRESULT WINAPI acmFormatTagEnumA(HACMDRIVER driver, LPACMFORMATTAGDETAILSA details,
-	ACMFORMATTAGENUMCBA callback, DWORD_PTR instance, DWORD flags)
-{
-	(void)driver;
-	if (!details || !callback || (flags & ~ACM_FORMATTAGDETAILSF_QUERYMASK))
-		return MMSYSERR_INVALPARAM;
-	for (DWORD index = 0; index < 2; ++index) {
-		ACMFORMATTAGDETAILSA current = {0};
-		current.cbStruct = sizeof(current);
-		current.dwFormatTagIndex = index;
-		if (acmFormatTagDetailsA(NULL, &current, ACM_FORMATTAGDETAILSF_INDEX) != MMSYSERR_NOERROR)
-			return ACMERR_NOTPOSSIBLE;
-		if (callback((HACMDRIVERID)1, &current, instance, current.fdwSupport) == FALSE)
-			break;
-	}
-	return MMSYSERR_NOERROR;
+#define DEFINE_TAG_ENUM(suffix) \
+__declspec(dllexport) MMRESULT WINAPI acmFormatTagEnum##suffix(HACMDRIVER driver, LPACMFORMATTAGDETAILS##suffix details, \
+	ACMFORMATTAGENUMCB##suffix callback, DWORD_PTR instance, DWORD flags) \
+{ \
+	(void)driver; \
+	if (!details || !callback || (flags & ~ACM_FORMATTAGDETAILSF_QUERYMASK)) \
+		return MMSYSERR_INVALPARAM; \
+	for (DWORD index = 0; index < 2; ++index) { \
+		ACMFORMATTAGDETAILS##suffix current = {0}; \
+		current.cbStruct = sizeof(current); \
+		current.dwFormatTagIndex = index; \
+		if (acmFormatTagDetails##suffix(NULL, &current, ACM_FORMATTAGDETAILSF_INDEX) != MMSYSERR_NOERROR) \
+			return ACMERR_NOTPOSSIBLE; \
+		if (callback((HACMDRIVERID)1, &current, instance, current.fdwSupport) == FALSE) \
+			break; \
+	} \
+	return MMSYSERR_NOERROR; \
 }
 
-__declspec(dllexport) MMRESULT WINAPI acmFormatTagEnumW(HACMDRIVER driver, LPACMFORMATTAGDETAILSW details,
-	ACMFORMATTAGENUMCBW callback, DWORD_PTR instance, DWORD flags)
-{
-	(void)driver;
-	if (!details || !callback || (flags & ~ACM_FORMATTAGDETAILSF_QUERYMASK))
-		return MMSYSERR_INVALPARAM;
-	for (DWORD index = 0; index < 2; ++index) {
-		ACMFORMATTAGDETAILSW current = {0};
-		current.cbStruct = sizeof(current);
-		current.dwFormatTagIndex = index;
-		if (acmFormatTagDetailsW(NULL, &current, ACM_FORMATTAGDETAILSF_INDEX) != MMSYSERR_NOERROR)
-			return ACMERR_NOTPOSSIBLE;
-		if (callback((HACMDRIVERID)1, &current, instance, current.fdwSupport) == FALSE)
-			break;
-	}
-	return MMSYSERR_NOERROR;
-}
+DEFINE_TAG_ENUM(A)
+DEFINE_TAG_ENUM(W)
 
-#define DEFINE_FORMAT_ENUM(suffix, type, callback_type, details_fn) \
+/* shortcut: CONVERT, SUGGEST, INPUT and OUTPUT do not narrow the list, filter by the format in pwfx when a program relies on them. */
+#define DEFINE_FORMAT_ENUM(suffix, callback_type, details_fn) \
 __declspec(dllexport) MMRESULT WINAPI acmFormatEnum##suffix(HACMDRIVER driver, LPACMFORMATDETAILS##suffix filter, \
 	callback_type callback, DWORD_PTR instance, DWORD flags) \
 { \
@@ -612,8 +598,8 @@ __declspec(dllexport) MMRESULT WINAPI acmFormatEnum##suffix(HACMDRIVER driver, L
 	return MMSYSERR_NOERROR; \
 }
 
-DEFINE_FORMAT_ENUM(A, A, ACMFORMATENUMCBA, acmFormatDetailsA)
-DEFINE_FORMAT_ENUM(W, W, ACMFORMATENUMCBW, acmFormatDetailsW)
+DEFINE_FORMAT_ENUM(A, ACMFORMATENUMCBA, acmFormatDetailsA)
+DEFINE_FORMAT_ENUM(W, ACMFORMATENUMCBW, acmFormatDetailsW)
 
 __declspec(dllexport) MMRESULT WINAPI acmDriverEnum(ACMDRIVERENUMCB callback, DWORD_PTR instance, DWORD flags)
 {
@@ -649,7 +635,7 @@ __declspec(dllexport) MMRESULT WINAPI acmDriverID(HACMOBJ object, LPHACMDRIVERID
 	return MMSYSERR_NOERROR;
 }
 
-#define DEFINE_DRIVER_DETAILS(suffix, type, copy_fn) \
+#define DEFINE_DRIVER_DETAILS(suffix, copy_fn) \
 __declspec(dllexport) MMRESULT WINAPI acmDriverDetails##suffix(HACMDRIVERID id, LPACMDRIVERDETAILS##suffix details, DWORD flags) \
 { \
 	if (id != (HACMDRIVERID)1 || !details || details->cbStruct < sizeof(*details) || flags) return MMSYSERR_INVALPARAM; \
@@ -665,8 +651,8 @@ __declspec(dllexport) MMRESULT WINAPI acmDriverDetails##suffix(HACMDRIVERID id, 
 	return MMSYSERR_NOERROR; \
 }
 
-DEFINE_DRIVER_DETAILS(A, A, copy_ascii_a)
-DEFINE_DRIVER_DETAILS(W, W, copy_ascii_w)
+DEFINE_DRIVER_DETAILS(A, copy_ascii_a)
+DEFINE_DRIVER_DETAILS(W, copy_ascii_w)
 
 __declspec(dllexport) MMRESULT WINAPI acmFormatSuggest(HACMDRIVER driver, LPWAVEFORMATEX source, LPWAVEFORMATEX destination,
 	DWORD destination_size, DWORD flags)
@@ -775,6 +761,7 @@ __declspec(dllexport) MMRESULT WINAPI acmStreamConvert(HACMSTREAM handle, LPACMS
 	return handle ? stream_convert((acm_stream *)handle, header, flags) : MMSYSERR_INVALHANDLE;
 }
 
+/* A stream keeps no state between conversions, so there is nothing to reset. */
 __declspec(dllexport) MMRESULT WINAPI acmStreamReset(HACMSTREAM handle, DWORD flags)
 {
 	(void)flags;

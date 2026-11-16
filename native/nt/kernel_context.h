@@ -123,9 +123,8 @@ void register_wave_api(ApiRegistry &registry, KernelContext &context);
 // MIDI as on a machine with no MIDI ports, for programs of either width.
 void register_midi_api(ApiRegistry &registry);
 void register_mmio_api(ApiRegistry &registry, KernelContext &context);
-// winmm multimedia timers and auxiliary audio on a machine without an auxiliary device.
-class EventPulses;
-void register_winmm_api(ApiRegistry &registry, KernelContext &context, std::shared_ptr<EventPulses> pulses);
+// winmm on a machine without an auxiliary audio device.
+void register_winmm_api(ApiRegistry &registry);
 void register_process_info_api(ApiRegistry &registry, KernelContext &context);
 void register_crypt32_api(ApiRegistry &registry, KernelContext &context);
 void register_bcrypt_api(ApiRegistry &registry, KernelContext &context);

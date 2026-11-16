@@ -24,22 +24,12 @@
 #define ALLOC(size) LocalAlloc(LPTR, (size))
 #define FREE(block) LocalFree(block)
 
-__declspec(dllimport) HANDLE WINAPI RavenAudioOpen(const WAVEFORMATEX *format, DWORD flags, DWORD buffer_frames, DWORD period_frames,
-	HANDLE event, RavenAudioShared **shared);
-__declspec(dllimport) BOOL WINAPI RavenAudioStart(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioStop(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioReset(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioClose(HANDLE stream);
-
 #ifndef DRVM_MAPPER_PREFERRED_GET
 #define DRVM_MAPPER_PREFERRED_GET 0x2015
 #endif
 #ifndef DRVM_MAPPER_CONSOLEVOICECOM_GET
 #define DRVM_MAPPER_CONSOLEVOICECOM_GET 0x2017
 #endif
-
-static inline UINT64 load64(const UINT64 *field) { return __atomic_load_n(field, __ATOMIC_ACQUIRE); }
-static inline void store64(UINT64 *field, UINT64 value) { __atomic_store_n(field, value, __ATOMIC_RELEASE); }
 
 /* What a device calls back with: a window or a thread is posted the message, a function is called, an event is set. */
 typedef struct notify {

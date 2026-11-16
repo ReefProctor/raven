@@ -45,9 +45,7 @@ NativeThreads::NativeThreads(NativeProcess &process, NativeEnvironment &environm
 	long slice = 5;
 	if (const char *text = std::getenv("RAVEN_SLICE_MS"))
 		slice = std::strtol(text, nullptr, 10);
-	process.set_time_slicing(std::chrono::milliseconds(slice < 0 ? 0 : slice), [this] {
-		return !tearing_down && (live() > 1 || std::any_of(dues.begin(), dues.end(), [](const auto &due) { return due(); }));
-	}, [this] { yield(); });
+	process.set_time_slicing(std::chrono::milliseconds(slice < 0 ? 0 : slice), [this] { return !tearing_down && live() > 1; }, [this] { yield(); });
 	wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (wake < 0)
 		throw std::runtime_error("cannot create the scheduler's wake descriptor");
@@ -114,11 +112,6 @@ std::shared_ptr<GuestThread> NativeThreads::create(uint64_t start, uint64_t para
 {
 	if (process.parallel())
 		reap();
-	// A finished thread whose resources are released and that no handle names is forgotten: programs that start a thread for every
-	// timer tick would otherwise grow the list every scheduling decision walks.
-	std::erase_if(threads, [this](const auto &thread) {
-		return thread->state == GuestThread::State::done && !thread->main && !thread->host_stack && thread.get() != running && thread.use_count() == 1;
-	});
 	if (live() >= 256)
 		throw std::runtime_error("native guest thread limit reached");
 	auto thread = std::make_shared<GuestThread>();

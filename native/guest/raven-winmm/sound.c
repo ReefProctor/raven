@@ -243,12 +243,11 @@ static BOOL sound_start(sound *sound)
 static void sound_wait(sound *sound)
 {
 	const HANDLE events[2] = {sound->done, sound->stop};
-	if (!(sound->header.dwFlags & WHDR_DONE))
-		while (!(sound->header.dwFlags & WHDR_DONE))
-			if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
-				waveOutReset(sound->device);
-				break;
-			}
+	while (!(sound->header.dwFlags & WHDR_DONE))
+		if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+			waveOutReset(sound->device);
+			break;
+		}
 	EnterCriticalSection(&sound_lock);
 	const BOOL mine = current == sound;
 	if (mine)
@@ -403,8 +402,8 @@ EXPORT BOOL WINAPI PlaySoundW(LPCWSTR name, HMODULE module, DWORD flags) { retur
 
 EXPORT BOOL WINAPI PlaySoundA(LPCSTR name, HMODULE module, DWORD flags)
 {
-	/* Memory, an id, and an atom name are passed through as they are. */
-	if (!name || (flags & SND_MEMORY) || (flags & SND_ALIAS_ID) == SND_ALIAS_ID || is_atom(name) || (flags & SND_PURGE))
+	/* Memory, an id, and an atom name are passed through as they are. SND_RESOURCE holds the SND_MEMORY bit and names a resource. */
+	if (!name || (flags & SND_RESOURCE) == SND_MEMORY || (flags & SND_ALIAS_ID) == SND_ALIAS_ID || is_atom(name) || (flags & SND_PURGE))
 		return play_sound((const WCHAR *)name, module, flags);
 	WCHAR *wide = wide_from_ascii(name);
 	if (!wide)

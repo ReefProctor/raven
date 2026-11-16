@@ -8,8 +8,6 @@
 
 client *clients;
 
-static UINT64 load(UINT64 *field) { return __atomic_load_n(field, __ATOMIC_ACQUIRE); }
-static void store(UINT64 *field, UINT64 value) { __atomic_store_n(field, value, __ATOMIC_RELEASE); }
 
 static client *client_of(IAudioClient3 *iface) { return CONTAINING_RECORD(iface, client, IAudioClient3_iface); }
 static client *render_of(IAudioRenderClient *iface) { return CONTAINING_RECORD(iface, client, IAudioRenderClient_iface); }
@@ -94,6 +92,11 @@ static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE 
 	/* Shared mode always runs at the device period; the buffer holds at least three, as Windows' engine gives. */
 	const UINT64 rate = format->nSamplesPerSec;
 	const UINT32 period = (UINT32)(rate * DEFAULT_PERIOD / 10000000);
+	/* Ten seconds is the largest buffer; a longer duration would also overflow the frame count below. */
+	if ((UINT64)duration > 10 * 10000000ull) {
+		LeaveCriticalSection(&audio->lock);
+		return AUDCLNT_E_BUFFER_SIZE_ERROR;
+	}
 	UINT64 frames = ((UINT64)duration * rate + 9999999) / 10000000;
 	if (frames < 3 * (UINT64)period)
 		frames = 3 * (UINT64)period;
@@ -174,7 +177,7 @@ static HRESULT WINAPI client_GetStreamLatency(IAudioClient3 *iface, REFERENCE_TI
 /* The capture packet ready now: a device period of frames, or fewer when the ring wraps first or the stream stopped with less. */
 static UINT32 next_packet(client *audio)
 {
-	const UINT64 read = load(&audio->shared->read_frames), available = load(&audio->shared->write_frames) - read;
+	const UINT64 read = load64(&audio->shared->read_frames), available = load64(&audio->shared->write_frames) - read;
 	const UINT32 contiguous = audio->buffer_frames - (UINT32)(read % audio->buffer_frames);
 	UINT32 packet = audio->period_frames;
 	if (available < packet)
@@ -195,10 +198,7 @@ static HRESULT WINAPI client_GetCurrentPadding(IAudioClient3 *iface, UINT32 *pad
 	if (!audio->initialized)
 		return AUDCLNT_E_NOT_INITIALIZED;
 	/* Recorded frames not yet taken, or written frames not yet played. */
-	if (capturing(audio))
-		*padding = (UINT32)(load(&audio->shared->write_frames) - load(&audio->shared->read_frames));
-	else
-		*padding = (UINT32)(load(&audio->shared->write_frames) - load(&audio->shared->read_frames));
+	*padding = (UINT32)(load64(&audio->shared->write_frames) - load64(&audio->shared->read_frames));
 	return S_OK;
 }
 
@@ -373,6 +373,7 @@ static HRESULT WINAPI client_IsOffloadCapable(IAudioClient3 *iface, AUDIO_STREAM
 	return S_OK;
 }
 
+/* shortcut: the category and options are accepted and dropped, pass them to the host when its streams carry a role. */
 static HRESULT WINAPI client_SetClientProperties(IAudioClient3 *iface, const AudioClientProperties *properties)
 {
 	client *audio = client_of(iface);
@@ -478,10 +479,10 @@ static HRESULT WINAPI render_GetBuffer(IAudioRenderClient *iface, UINT32 frames,
 		return E_POINTER;
 	*data = NULL;
 	EnterCriticalSection(&audio->lock);
-	const UINT64 written = load(&audio->shared->write_frames);
+	const UINT64 written = load64(&audio->shared->write_frames);
 	if (audio->pending)
 		result = AUDCLNT_E_OUT_OF_ORDER;
-	else if (frames > audio->buffer_frames - (UINT32)(written - load(&audio->shared->read_frames)))
+	else if (frames > audio->buffer_frames - (UINT32)(written - load64(&audio->shared->read_frames)))
 		result = AUDCLNT_E_BUFFER_TOO_LARGE;
 	else if (frames) {
 		const UINT32 start = (UINT32)(written % audio->buffer_frames);
@@ -506,7 +507,7 @@ static HRESULT WINAPI render_ReleaseBuffer(IAudioRenderClient *iface, UINT32 fra
 	else if (frames > audio->pending)
 		result = AUDCLNT_E_INVALID_SIZE;
 	else {
-		const UINT64 written = load(&audio->shared->write_frames);
+		const UINT64 written = load64(&audio->shared->write_frames);
 		if (frames) {
 			BYTE *data = audio->in_scratch ? audio->scratch
 						       : audio->ring + (SIZE_T)(written % audio->buffer_frames) * audio->frame_bytes;
@@ -515,7 +516,7 @@ static HRESULT WINAPI render_ReleaseBuffer(IAudioRenderClient *iface, UINT32 fra
 				memset(data, audio->format->wBitsPerSample == 8 ? 0x80 : 0, (SIZE_T)frames * audio->frame_bytes);
 			if (audio->in_scratch)
 				copy_ring(audio, written, audio->scratch, frames, TRUE);
-			store(&audio->shared->write_frames, written + frames);
+			store64(&audio->shared->write_frames, written + frames);
 		}
 		audio->pending = 0;
 	}
@@ -562,8 +563,8 @@ static HRESULT WINAPI capture_GetBuffer(IAudioCaptureClient *iface, BYTE **data,
 		result = AUDCLNT_S_BUFFER_EMPTY;
 	else {
 		RavenAudioShared *shared = audio->shared;
-		const UINT64 read = load(&shared->read_frames), written = load(&shared->write_frames),
-			glitches = load(&shared->glitch_frames);
+		const UINT64 read = load64(&shared->read_frames), written = load64(&shared->write_frames),
+			glitches = load64(&shared->glitch_frames);
 		*data = audio->ring + (SIZE_T)(read % audio->buffer_frames) * audio->frame_bytes;
 		*frames = audio->pending;
 		/* Told until the packet is released: one released empty comes again with the same flag. */
@@ -574,7 +575,7 @@ static HRESULT WINAPI capture_GetBuffer(IAudioCaptureClient *iface, BYTE **data,
 			*device_position = read;
 		/* The packet's first frame was recorded as long before the newest as the frames after it last. */
 		if (counter) {
-			const UINT64 stamp = load(&shared->position_counter), before = (written - read) * 10000000 / shared->rate;
+			const UINT64 stamp = load64(&shared->position_counter), before = (written - read) * 10000000 / shared->rate;
 			*counter = stamp > before ? stamp - before : stamp;
 		}
 	}
@@ -594,7 +595,7 @@ static HRESULT WINAPI capture_ReleaseBuffer(IAudioCaptureClient *iface, UINT32 f
 	else {
 		/* Releasing none keeps the packet for the next GetBuffer. */
 		if (frames) {
-			store(&audio->shared->read_frames, load(&audio->shared->read_frames) + frames);
+			store64(&audio->shared->read_frames, load64(&audio->shared->read_frames) + frames);
 			audio->glitches = audio->packet_glitches;
 		}
 		audio->pending = 0;
@@ -652,8 +653,8 @@ static HRESULT WINAPI clock_GetFrequency(IAudioClock *iface, UINT64 *frequency)
 static UINT64 position_now(client *audio, UINT64 *counter)
 {
 	RavenAudioShared *shared = audio->shared;
-	UINT64 position = load(&shared->position_frames);
-	const UINT64 stamp = load(&shared->position_counter);
+	UINT64 position = load64(&shared->position_frames);
+	const UINT64 stamp = load64(&shared->position_counter);
 	if (__atomic_load_n(&shared->running, __ATOMIC_ACQUIRE)) {
 		const UINT64 now = counter_now();
 		UINT64 extra = now > stamp ? (now - stamp) * shared->rate / 10000000 : 0;
@@ -661,7 +662,7 @@ static UINT64 position_now(client *audio, UINT64 *counter)
 			extra = audio->period_frames;
 		position += extra;
 		if (!capturing(audio)) {
-			const UINT64 written = load(&shared->write_frames);
+			const UINT64 written = load64(&shared->write_frames);
 			if (position > written)
 				position = written;
 		}
@@ -742,7 +743,6 @@ static HRESULT WINAPI stream_volume_GetChannelCount(IAudioStreamVolume *iface, U
 	return S_OK;
 }
 
-static BOOL level_valid(float level) { return level >= 0 && level <= 1; }
 
 static HRESULT WINAPI stream_volume_SetChannelVolume(IAudioStreamVolume *iface, UINT32 index, const float level)
 {

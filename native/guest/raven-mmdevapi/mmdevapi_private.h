@@ -53,13 +53,7 @@ static const GUID subtype_float = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00
 #define ALLOC(size) LocalAlloc(LPTR, (size))
 #define FREE(block) LocalFree(block)
 
-__declspec(dllimport) HANDLE WINAPI RavenAudioOpen(const WAVEFORMATEX *format, DWORD flags, DWORD buffer_frames, DWORD period_frames,
-	HANDLE event, RavenAudioShared **shared);
-__declspec(dllimport) BOOL WINAPI RavenAudioSetEvent(HANDLE stream, HANDLE event);
-__declspec(dllimport) BOOL WINAPI RavenAudioStart(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioStop(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioReset(HANDLE stream);
-__declspec(dllimport) BOOL WINAPI RavenAudioClose(HANDLE stream);
+static inline BOOL level_valid(float level) { return level >= 0 && level <= 1; }
 
 /* The mix format of both endpoints: what the engine mixes in on Windows, and what the sound server is asked for when a program takes it. */
 #define MIX_RATE 48000u
@@ -93,7 +87,6 @@ typedef struct session {
 /* The endpoint's volume, which every client of the endpoint is scaled by. */
 typedef struct endpoint_volume {
 	IAudioEndpointVolumeEx IAudioEndpointVolumeEx_iface;
-	struct device *device;
 	float master;
 	float channels[MIX_CHANNELS];
 	BOOL mute;
@@ -109,7 +102,6 @@ typedef struct device {
 	IAudioMeterInformation IAudioMeterInformation_iface;
 	EDataFlow flow;
 	const WCHAR *id, *name;
-	const GUID *guid;
 	endpoint_volume volume;
 	session *sessions;
 } device;
@@ -156,8 +148,6 @@ int same_guid(const GUID *left, const GUID *right);
 WCHAR *copy_string(const WCHAR *text);
 WAVEFORMATEX *copy_format(const WAVEFORMATEX *format);
 WAVEFORMATEX *mix_format(void);
-/* Whether the engine plays the format: integer PCM of 8, 16, 24 or 32 bits or 32-bit float, plain or extensible, 1 to 8 channels. */
-BOOL format_valid(const WAVEFORMATEX *format);
 float decibels_of(float scalar);
 float scalar_of(float decibels);
 /* QueryPerformanceCounter in 100-nanosecond units, as the shared page's position_counter. */

@@ -14,7 +14,7 @@ class EventObject;
 struct GuestThread;
 
 // PulseEvent as Windows does it: every thread waiting on a manual-reset event, or one thread waiting on an auto-reset event, is released
-// and the event stays nonsignaled. A cooperative wait only sees its event when the scheduler next looks at that thread, so each released
+// and the event ends nonsignaled. A cooperative wait only sees its event when the scheduler next looks at that thread, so each released
 // thread gets a pulse of its own that lasts until its wait takes it.
 class EventPulses {
 public:
@@ -34,7 +34,6 @@ private:
 	std::vector<Pulse> pulses;
 };
 
-// Registers PulseEvent and returns the pulses it shares with the runtime's other users, such as the multimedia timers.
-std::shared_ptr<EventPulses> register_pulse_event(ApiRegistry &registry, KernelContext &context);
+void register_pulse_event(ApiRegistry &registry, KernelContext &context);
 
 }

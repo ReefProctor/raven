@@ -5,12 +5,10 @@
  */
 #include "winmm_private.h"
 
-#define MIXER_MAGIC 0x5849584du
 #define CONTROL_COUNT 8
 #define LINE_COUNT 4
 
 typedef struct mixer {
-	DWORD magic;
 	struct mixer *next;
 	notify notify;
 } mixer;
@@ -40,6 +38,8 @@ static BOOL mutes[LINE_COUNT];
 
 void mixer_init(void) { InitializeCriticalSection(&mixer_lock); }
 
+/* shortcut: the louder channel scales both and the recording lines scale nothing, a stream has one gain and capture none; apply them
+ * when the engine takes a gain per channel and for capture. */
 static float line_scale(int index)
 {
 	if (mutes[index])
@@ -101,9 +101,7 @@ static void mixer_caps(MIXERCAPSW *caps)
 	caps->wMid = MM_MICROSOFT;
 	caps->wPid = MM_MSFT_WSS_MIXER;
 	caps->vDriverVersion = 0x0500;
-	const WCHAR *name = L"Raven Audio Mixer";
-	for (size_t index = 0; name[index]; index++)
-		caps->szPname[index] = name[index];
+	lstrcpynW(caps->szPname, L"Raven Audio Mixer", MAXPNAMELEN);
 	caps->cDestinations = 2;
 }
 
@@ -152,7 +150,6 @@ EXPORT MMRESULT WINAPI mixerOpen(LPHMIXER out, UINT id, DWORD_PTR callback, DWOR
 	mixer *made = ALLOC(sizeof *made);
 	if (!made)
 		return MMSYSERR_NOMEM;
-	made->magic = MIXER_MAGIC;
 	made->notify = notify;
 	EnterCriticalSection(&mixer_lock);
 	made->next = mixers;
@@ -170,7 +167,6 @@ EXPORT MMRESULT WINAPI mixerClose(HMIXER handle)
 			mixer *gone = *link;
 			*link = gone->next;
 			LeaveCriticalSection(&mixer_lock);
-			gone->magic = 0;
 			FREE(gone);
 			return MMSYSERR_NOERROR;
 		}
@@ -202,14 +198,6 @@ static const line *line_by_id(DWORD id)
 		if (lines[index].id == id)
 			return &lines[index];
 	return NULL;
-}
-
-static void copy_name(WCHAR *target, size_t size, const WCHAR *source)
-{
-	size_t index = 0;
-	for (; index + 1 < size && source[index]; index++)
-		target[index] = source[index];
-	target[index] = 0;
 }
 
 /* Finds the line the query names from the fields it reads, and fills in the rest. */
@@ -252,15 +240,15 @@ static MMRESULT line_info(MIXERLINEW *info, DWORD query)
 	info->cChannels = found->channels;
 	info->cConnections = found->connections;
 	info->cControls = 2;
-	copy_name(info->szShortName, MIXER_SHORT_NAME_CHARS, found->short_name);
-	copy_name(info->szName, MIXER_LONG_NAME_CHARS, found->name);
+	lstrcpynW(info->szShortName, found->short_name, MIXER_SHORT_NAME_CHARS);
+	lstrcpynW(info->szName, found->name, MIXER_LONG_NAME_CHARS);
 	info->Target.dwType = found->target;
 	info->Target.dwDeviceID = 0;
 	info->Target.wMid = MM_MICROSOFT;
 	info->Target.wPid = found->target == MIXERLINE_TARGETTYPE_WAVEOUT ? MM_MSFT_WSS_WAVEOUT : MM_MSFT_WSS_WAVEIN;
 	info->Target.vDriverVersion = 0x0500;
-	copy_name(info->Target.szPname, MAXPNAMELEN,
-		found->target == MIXERLINE_TARGETTYPE_WAVEOUT ? L"Speakers (Raven Audio)" : L"Microphone (Raven Audio)");
+	lstrcpynW(info->Target.szPname,
+		found->target == MIXERLINE_TARGETTYPE_WAVEOUT ? L"Speakers (Raven Audio)" : L"Microphone (Raven Audio)", MAXPNAMELEN);
 	return MMSYSERR_NOERROR;
 }
 
@@ -322,14 +310,14 @@ static void control_info(DWORD id, MIXERCONTROLW *control)
 	if (id & 1) {
 		control->dwControlType = MIXERCONTROL_CONTROLTYPE_MUTE;
 		control->fdwControl = MIXERCONTROL_CONTROLF_UNIFORM;
-		copy_name(control->szShortName, MIXER_SHORT_NAME_CHARS, L"Mute");
-		copy_name(control->szName, MIXER_LONG_NAME_CHARS, L"Mute");
+		lstrcpynW(control->szShortName, L"Mute", MIXER_SHORT_NAME_CHARS);
+		lstrcpynW(control->szName, L"Mute", MIXER_LONG_NAME_CHARS);
 		control->Bounds.dwMinimum = 0;
 		control->Bounds.dwMaximum = 1;
 	} else {
 		control->dwControlType = MIXERCONTROL_CONTROLTYPE_VOLUME;
-		copy_name(control->szShortName, MIXER_SHORT_NAME_CHARS, L"Volume");
-		copy_name(control->szName, MIXER_LONG_NAME_CHARS, L"Volume");
+		lstrcpynW(control->szShortName, L"Volume", MIXER_SHORT_NAME_CHARS);
+		lstrcpynW(control->szName, L"Volume", MIXER_LONG_NAME_CHARS);
 		control->Bounds.dwMinimum = 0;
 		control->Bounds.dwMaximum = 0xffff;
 		control->Metrics.cSteps = 192;
@@ -442,7 +430,7 @@ static MMRESULT details_check(const MIXERCONTROLDETAILS *details, DWORD flags)
 		return (flags & MIXER_GETCONTROLDETAILSF_QUERYMASK) == MIXER_GETCONTROLDETAILSF_LISTTEXT ? MMSYSERR_INVALPARAM : MMSYSERR_INVALFLAG;
 	const BOOL mute = details->dwControlID & 1;
 	const DWORD channels = details->cChannels;
-	if (!details->paDetails || details->cMultipleItems || (mute ? channels != 1 && channels != 2 : channels != 1 && channels != 2) ||
+	if (!details->paDetails || details->cMultipleItems || (channels != 1 && channels != 2) ||
 		details->cbDetails < (mute ? sizeof(MIXERCONTROLDETAILS_BOOLEAN) : sizeof(MIXERCONTROLDETAILS_UNSIGNED)))
 		return MMSYSERR_INVALPARAM;
 	return MMSYSERR_NOERROR;
@@ -494,7 +482,8 @@ EXPORT MMRESULT WINAPI mixerSetControlDetails(HMIXEROBJ object, LPMIXERCONTROLDE
 			volumes[index][channel] = value > 0xffff ? 0xffff : value;
 		}
 	}
-	/* Every mixer handle hears of the change; they are told after the lock is left. */
+	/* Every mixer handle hears of the change; they are told after the lock is left.
+	 * shortcut: the first 16 handles are told, allocate the list when a program opens more. */
 	notify targets[16];
 	HMIXER handles[16];
 	int count = 0;

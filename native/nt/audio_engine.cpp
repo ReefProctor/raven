@@ -10,6 +10,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
+#include <span>
 #include <string>
 #include <sys/mman.h>
 #include <thread>
@@ -144,20 +145,17 @@ public:
 	{
 		static std::mutex guard;
 		static std::shared_ptr<PulseContext> shared;
-		static bool failed = false;
 		std::lock_guard lock(guard);
-		// A server that went away (restarted, or the session ended) is connected to again; one that never answered is not retried.
+		// A server that went away (restarted, or the session ended) is connected to again.
 		if (shared && !shared->ready())
 			shared.reset();
-		if (shared || failed)
+		if (shared)
 			return shared;
-		const auto *api = pulse_api();
-		if (api) {
+		if (const auto *api = pulse_api()) {
 			auto made = std::shared_ptr<PulseContext>(new PulseContext(*api));
 			if (made->connect())
 				shared = std::move(made);
 		}
-		failed = !shared;
 		return shared;
 	}
 	~PulseContext()
@@ -185,15 +183,14 @@ public:
 		const PulseContext &pulse;
 	};
 
-	// Waits, with the main loop locked, for an operation started under that lock to finish; false when it could not start.
-	bool finish(void *operation) const
+	// Waits, with the main loop locked, for an operation started under that lock to finish. A stream the server dropped starts none.
+	void finish(void *operation) const
 	{
 		if (!operation)
-			return false;
+			return;
 		while (api.operation_get_state(operation) == pa_operation_running)
 			api.mainloop_wait(loop);
 		api.operation_unref(operation);
-		return true;
 	}
 	bool ready() const
 	{
@@ -277,14 +274,15 @@ std::optional<AudioFormat> read_wave_format(ApiCall &call, uint64_t address)
 	std::memcpy(&block, bytes.data() + 12, 2);
 	std::memcpy(&bits, bytes.data() + 14, 2);
 	if (tag == 0xfffe) {
-		const auto extended = call.read(address + 16, 26);
+		// cbSize, wValidBitsPerSample and dwChannelMask come before SubFormat: the format tag, then the same twelve bytes for every tag.
+		static constexpr uint8_t subformat_tail[12] = {0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+		const auto extended = call.read(address + 16, 24);
 		uint16_t extra;
 		std::memcpy(&extra, extended.data(), 2);
-		if (extra < 22)
-			return std::nullopt;
-		// cbSize, wValidBitsPerSample and dwChannelMask come before SubFormat, whose first four bytes are the format tag.
 		uint32_t subformat;
 		std::memcpy(&subformat, extended.data() + 8, 4);
+		if (extra < 22 || subformat > 0xffff || std::memcmp(extended.data() + 12, subformat_tail, sizeof subformat_tail))
+			return std::nullopt;
 		tag = uint16_t(subformat);
 	}
 	AudioFormat format{rate, channels, bits, block, tag == 3};
@@ -295,8 +293,8 @@ std::optional<AudioFormat> read_wave_format(ApiCall &call, uint64_t address)
 }
 
 AudioStream::AudioStream(Options options, int memory, size_t size, RavenAudioShared *page)
-	: stream_format(options.format), capturing(options.capture), notify(std::move(options.notify)), refill(std::move(options.refill)),
-	  memory(memory), size(size), page(page)
+	: stream_format(options.format), capturing(options.capture), ring_frames(options.buffer_frames), period_frames(options.period_frames),
+	  notify(std::move(options.notify)), memory(memory), size(size), page(page)
 {
 }
 
@@ -306,22 +304,11 @@ AudioStream::~AudioStream()
 	::close(memory);
 }
 
-bool AudioStream::running() const { return std::atomic_ref<uint32_t>(page->running).load(std::memory_order_acquire) != 0; }
-
-uint64_t AudioStream::position() const { return counter(page->position_frames).load(std::memory_order_acquire); }
-
-uint64_t AudioStream::space() const
-{
-	const uint64_t used = counter(page->write_frames).load(std::memory_order_relaxed) - counter(page->read_frames).load(std::memory_order_acquire);
-	return page->buffer_frames - std::min<uint64_t>(used, page->buffer_frames);
-}
-
 uint64_t AudioStream::pending() const
 {
-	return counter(page->write_frames).load(std::memory_order_acquire) - counter(page->read_frames).load(std::memory_order_relaxed);
+	const uint64_t held = counter(page->write_frames).load(std::memory_order_acquire) - counter(page->read_frames).load(std::memory_order_relaxed);
+	return std::min<uint64_t>(held, ring_frames);
 }
-
-uint64_t AudioStream::available() const { return pending(); }
 
 namespace {
 
@@ -352,26 +339,10 @@ void copy_ring(uint8_t *ring, uint64_t frames, uint32_t block, uint64_t at, uint
 
 }
 
-uint64_t AudioStream::write(const uint8_t *frames, uint64_t count)
-{
-	const uint64_t at = counter(page->write_frames).load(std::memory_order_relaxed);
-	count = std::min(count, space());
-	copy_ring(ring(), page->buffer_frames, page->frame_bytes, at, const_cast<uint8_t *>(frames), count, true);
-	counter(page->write_frames).store(at + count, std::memory_order_release);
-	return count;
-}
-
-uint64_t AudioStream::read(uint8_t *frames, uint64_t count)
-{
-	count = std::min(count, available());
-	consume(frames, count);
-	return count;
-}
-
 void AudioStream::consume(uint8_t *out, uint64_t count)
 {
 	const uint64_t at = counter(page->read_frames).load(std::memory_order_relaxed);
-	copy_ring(ring(), page->buffer_frames, page->frame_bytes, at, out, count, false);
+	copy_ring(ring(), ring_frames, stream_format.block, at, out, count, false);
 	counter(page->read_frames).store(at + count, std::memory_order_release);
 }
 
@@ -379,31 +350,31 @@ void AudioStream::produce(const uint8_t *in, uint64_t count)
 {
 	const uint64_t at = counter(page->write_frames).load(std::memory_order_relaxed);
 	const uint64_t used = at - counter(page->read_frames).load(std::memory_order_acquire);
-	const uint64_t room = page->buffer_frames - std::min<uint64_t>(used, page->buffer_frames), taken = std::min(count, room);
+	const uint64_t room = ring_frames - std::min<uint64_t>(used, ring_frames), taken = std::min(count, room);
 	// Unsigned 8-bit samples are silent at their midpoint.
 	const uint8_t silence = !stream_format.floating && stream_format.bits == 8 ? 0x80 : 0;
-	copy_ring(ring(), page->buffer_frames, page->frame_bytes, at, const_cast<uint8_t *>(in), taken, true, silence);
+	copy_ring(ring(), ring_frames, stream_format.block, at, const_cast<uint8_t *>(in), taken, true, silence);
 	counter(page->write_frames).store(at + taken, std::memory_order_release);
 	if (taken < count)
-		counter(page->glitch_frames).fetch_add(count - taken, std::memory_order_relaxed);
+		counter(page->glitch_frames).fetch_add(count - taken);
 }
 
 void AudioStream::set_position(uint64_t frames)
 {
-	counter(page->position_counter).store(counter_ticks(), std::memory_order_relaxed);
-	counter(page->position_frames).store(frames, std::memory_order_release);
+	counter(page->position_counter).store(counter_ticks());
+	counter(page->position_frames).store(frames);
 }
 
 void AudioStream::clear_counters()
 {
 	for (auto *field : {&page->write_frames, &page->read_frames, &page->glitch_frames})
-		counter(*field).store(0, std::memory_order_relaxed);
+		counter(*field).store(0);
 	set_position(0);
 }
 
-void AudioStream::set_running(bool value) { std::atomic_ref<uint32_t>(page->running).store(value, std::memory_order_release); }
+void AudioStream::set_running(bool value) { std::atomic_ref<uint32_t>(page->running).store(value); }
 
-float AudioStream::volume() const { return std::bit_cast<float>(std::atomic_ref<uint32_t>(page->volume).load(std::memory_order_relaxed)); }
+float AudioStream::volume() const { return std::bit_cast<float>(std::atomic_ref<uint32_t>(page->volume).load()); }
 
 namespace {
 
@@ -424,7 +395,6 @@ public:
 		changed.notify_all();
 		worker.join();
 	}
-	std::string_view backend() const override { return "null"; }
 	void start() override
 	{
 		{
@@ -458,19 +428,22 @@ public:
 private:
 	void run()
 	{
-		const uint32_t rate = stream_format.rate, period = period_frames();
+		const uint64_t rate = stream_format.rate, second = 1000000000;
+		// Split at whole seconds: the plain product passes 64 bits after some hours of one run.
+		const auto frames_in = [&](uint64_t nanoseconds) { return nanoseconds / second * rate + nanoseconds % second * rate / second; };
+		const auto time_of = [&](uint64_t frames) { return std::chrono::nanoseconds(frames / rate * second + frames % rate * second / rate); };
 		std::unique_lock lock(mutex);
 		while (!closing) {
 			if (!active) {
 				changed.wait(lock);
 				continue;
 			}
-			const auto due = since + std::chrono::nanoseconds((device_frames - before + period) * 1000000000ULL / rate);
+			const auto due = since + time_of(device_frames - before + period_frames);
 			changed.wait_until(lock, due);
 			if (closing || !active)
 				continue;
 			const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count();
-			const uint64_t total = before + uint64_t(elapsed) * rate / 1000000000ULL;
+			const uint64_t total = before + frames_in(uint64_t(elapsed));
 			if (total <= device_frames)
 				continue;
 			const uint64_t frames = total - device_frames;
@@ -481,13 +454,11 @@ private:
 				set_position(played);
 				produce(nullptr, frames);
 			} else {
-				if (refill)
-					refill(*this);
 				const uint64_t taken = std::min(frames, pending());
 				consume(nullptr, taken);
 				played += taken;
 				if (taken < frames)
-					counter(shared().glitch_frames).fetch_add(frames - taken, std::memory_order_relaxed);
+					counter(shared().glitch_frames).fetch_add(frames - taken);
 				set_position(played);
 			}
 			lock.unlock();
@@ -543,7 +514,7 @@ public:
 		const int sample = format.floating ? pa_sample_float32le : format.bits == 8 ? pa_sample_u8 : format.bits == 16 ? pa_sample_s16le :
 			format.bits == 24 ? pa_sample_s24le : pa_sample_s32le;
 		const pa_sample_spec spec{sample, format.rate, uint8_t(format.channels)};
-		const uint32_t period = period_frames() * format.block;
+		const uint32_t period = period_frames * format.block;
 		PulseContext::Lock lock(*pulse);
 		stream = api.stream_new(pulse->context, capturing ? "Windows program recording" : "Windows program", &spec, nullptr);
 		if (!stream)
@@ -576,11 +547,9 @@ public:
 				return false;
 			api.mainloop_wait(pulse->loop);
 		}
-		if (!capturing)
-			ticker = std::thread([this] { tick(); });
+		ticker = std::thread([this] { tick(); });
 		return true;
 	}
-	std::string_view backend() const override { return "pulse"; }
 	void start() override
 	{
 		PulseContext::Lock lock(*pulse);
@@ -590,10 +559,8 @@ public:
 		pulse->finish(pulse->api.stream_cork(stream, 0, &PulseContext::signal, pulse.get()));
 		set_position(played);
 		set_running(true);
-		if (!capturing) {
-			feed();
-			set_ticking(true);
-		}
+		feed();
+		set_ticking(true);
 	}
 	void stop() override
 	{
@@ -641,8 +608,6 @@ private:
 		if (!active || capturing)
 			return;
 		const auto &api = pulse->api;
-		if (refill)
-			refill(*this);
 		const size_t room = api.stream_writable_size(stream);
 		if (room != size_t(-1)) {
 			const uint64_t frames = std::min<uint64_t>(room / stream_format.block, pending());
@@ -685,6 +650,22 @@ private:
 		if (now > base + heard)
 			base = now - heard;
 	}
+	// With the main loop locked, after the server dropped the stream: a period plays to nowhere or records silence, so the program's
+	// buffers still come back.
+	void discard()
+	{
+		if (capturing) {
+			played += period_frames;
+			set_position(played);
+			produce(nullptr, period_frames);
+			return;
+		}
+		const uint64_t frames = std::min<uint64_t>(period_frames, pending());
+		consume(nullptr, frames);
+		written += frames;
+		played = written;
+		set_position(played);
+	}
 	// With the main loop locked: the server delivered recorded frames.
 	void take()
 	{
@@ -706,11 +687,12 @@ private:
 		if (any && notify)
 			notify();
 	}
-	// Playback only: once a period while the stream plays, feeds the server and tells the owner; parked while it is stopped. The thread's
-	// own lock is never held while it takes the main loop's, which start and halt hold while they take the thread's.
+	// Once a period while the stream runs: feeds the server and tells the owner of a playback stream, and stands in for a server that
+	// dropped the stream; parked while it is stopped. The thread's own lock is never held while it takes the main loop's, which start and
+	// halt hold while they take the thread's.
 	void tick()
 	{
-		const auto period = std::chrono::nanoseconds(uint64_t(period_frames()) * 1000000000ULL / stream_format.rate);
+		const auto period = std::chrono::nanoseconds(uint64_t(period_frames) * 1000000000ULL / stream_format.rate);
 		auto next = std::chrono::steady_clock::now() + period;
 		std::unique_lock lock(mutex);
 		while (!closing) {
@@ -724,16 +706,21 @@ private:
 				continue;
 			next = std::max(next + period, std::chrono::steady_clock::now());
 			lock.unlock();
-			bool playing;
+			bool tell;
 			{
 				PulseContext::Lock pulse_lock(*pulse);
-				feed();
-				playing = active;
+				const bool lost = active && pulse->api.stream_get_state(stream) != pa_stream_ready;
+				// take() tells the owner of a recording that the server still delivers.
+				tell = active && (lost || !capturing);
+				if (lost)
+					discard();
+				else
+					feed();
 				// The server ran dry and nothing came since: the device went a period without frames.
-				if (playing && underflowed)
-					counter(shared().glitch_frames).fetch_add(period_frames(), std::memory_order_relaxed);
+				if (active && underflowed)
+					counter(shared().glitch_frames).fetch_add(period_frames);
 			}
-			if (playing && notify)
+			if (tell && notify)
 				notify();
 			lock.lock();
 		}
@@ -752,8 +739,10 @@ private:
 	std::thread ticker;
 };
 
-std::optional<Mapping> make_mapping(const AudioFormat &format, uint32_t buffer, uint32_t period, bool capture)
+std::optional<Mapping> make_mapping(const AudioStream::Options &options)
 {
+	const auto &format = options.format;
+	const uint32_t buffer = options.buffer_frames, period = options.period_frames;
 	const uint64_t data = (uint64_t(buffer) * format.block + 4095) & ~uint64_t(4095);
 	if (data > (64u << 20))
 		return std::nullopt;
@@ -779,7 +768,7 @@ std::optional<Mapping> make_mapping(const AudioFormat &format, uint32_t buffer, 
 	page.bits = format.bits;
 	page.format_tag = format.floating ? 3 : 1;
 	page.period_frames = period;
-	page.flags = capture ? RAVEN_AUDIO_CAPTURE : 0;
+	page.flags = options.capture ? RAVEN_AUDIO_CAPTURE : 0;
 	page.position_counter = counter_ticks();
 	return mapping;
 }
@@ -789,21 +778,19 @@ std::optional<Mapping> make_mapping(const AudioFormat &format, uint32_t buffer, 
 std::unique_ptr<AudioStream> AudioStream::open(Options options)
 {
 	const auto &format = options.format;
-	if (!format.rate || !format.block)
+	if (!format.rate || !format.block || !options.period_frames || options.buffer_frames < options.period_frames)
 		return nullptr;
-	const uint32_t period = options.period_frames ? options.period_frames : std::max<uint32_t>(format.rate / 100, 1);
-	const uint32_t buffer = std::max(options.buffer_frames ? options.buffer_frames : format.rate / 10, period);
 	const char *chosen = std::getenv("RAVEN_AUDIO");
 	if (!chosen || std::string_view(chosen) != "null")
 		if (auto context = PulseContext::get()) {
-			auto mapping = make_mapping(format, buffer, period, options.capture);
+			auto mapping = make_mapping(options);
 			if (!mapping)
 				return nullptr;
 			auto stream = std::make_unique<PulseStream>(options, *mapping, std::move(context));
 			if (stream->connect())
 				return stream;
 		}
-	auto mapping = make_mapping(format, buffer, period, options.capture);
+	auto mapping = make_mapping(options);
 	if (!mapping)
 		return nullptr;
 	return std::make_unique<NullStream>(std::move(options), *mapping);

@@ -119,9 +119,6 @@ public:
 	void add_pump(std::function<void()> work) { pumps.push_back(std::move(work)); }
 	// Runs at every scheduling decision, also while threads run: requests from other processes are answered without waiting for idleness.
 	void add_service(std::function<void()> work) { services.push_back(std::move(work)); }
-	// True while host work is due that a service starts, such as a multimedia timer's callback: a thread that runs alone, without calling
-	// the runtime, is then interrupted as by a time slice so the services get to run.
-	void add_due(std::function<bool()> due) { dues.push_back(std::move(due)); }
 	void serve();
 	// Ends the scheduler's idle wait early: called from a host thread that finished work a waiting guest thread looks for.
 	void nudge();
@@ -170,7 +167,6 @@ private:
 	// When a wait that does not wait last let the services and pumps run.
 	std::chrono::steady_clock::time_point pumped{};
 	std::vector<std::function<void()>> services;
-	std::vector<std::function<bool()>> dues;
 	// Written to end the idle wait: by nudge() and by the thread that sees other processes change shared objects.
 	int wake = -1;
 	std::function<void(std::vector<pollfd> &)> watched;
