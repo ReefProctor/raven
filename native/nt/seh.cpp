@@ -16,6 +16,19 @@ namespace raven {
 
 namespace {
 
+// Where the frames go on past a callback's boundary: in the call that made the callback. A callback the guest ran from inside a stub
+// kept only that call's instruction and stack pointers; its other registers are those the callback's frames gave back in `reached`.
+ContextBytes callback_frames(const NativeProcess &process, size_t index, const ContextBytes &reached)
+{
+	const auto origin = process.callback_origin(index);
+	if (!process.callback_in_stub(index))
+		return context_from_process(origin);
+	ContextBytes frames = reached;
+	set_context_rip(frames, origin.registers.rip);
+	set_context_rsp(frames, origin.registers.rsp);
+	return frames;
+}
+
 constexpr size_t record_size = 152;
 constexpr uint32_t flag_noncontinuable = 1, flag_unwinding = 2, flag_exit_unwind = 4, flag_target_unwind = 0x20, flag_nested = 0x10;
 constexpr uint32_t status_unwind_consolidate = 0x80000029U, status_unwind = 0xc0000027U, status_noncontinuable = 0xc0000025U, status_invalid_disposition = 0xc0000026U;
@@ -116,8 +129,9 @@ public:
 		mine().active.push_back({origin, context.process.callback_depth(), mark});
 		if (trace)
 		{
-			std::fprintf(stderr, "seh dispatch begin: code=%x active=%zu depth=%zu scratch=%zx params=%x info1=%llx info2=%llx rsp=%llx\n", le32(record, 0), mine().active.size(),
-				context.process.callback_depth(), mine().scratch.mark(), le32(record, 0x18), (unsigned long long)load64(record, 0x28), (unsigned long long)load64(record, 0x30),
+			std::fprintf(stderr, "seh dispatch begin: code=%x active=%zu depth=%zu scratch=%zx params=%x info0=%llx info1=%llx info2=%llx rsp=%llx\n", le32(record, 0),
+				mine().active.size(), context.process.callback_depth(), mine().scratch.mark(), le32(record, 0x18), (unsigned long long)load64(record, 0x20),
+				(unsigned long long)load64(record, 0x28), (unsigned long long)load64(record, 0x30),
 				(unsigned long long)context_rsp(origin));
 			if (le32(record, 0x18) >= 2) {
 				try {
@@ -143,8 +157,8 @@ public:
 			if (!pc)
 				break;
 			const auto function = unwinder.lookup(pc);
-			if (!function && pc == context.process.return_gate() && outer == 0 && continuation_cursor >= mine().continuation.size() && level > 0) {
-				current = context_from_process(context.process.callback_origin(--level));
+			if (!function && context.process.callback_boundary(pc) && outer == 0 && continuation_cursor >= mine().continuation.size() && level > 0) {
+				current = callback_frames(context.process, --level, current);
 				if (trace)
 					std::fprintf(stderr, "seh frame: callback boundary, continuing at level %zu from %llx\n", level, (unsigned long long)context_rip(current));
 				continue;
@@ -156,22 +170,22 @@ public:
 					current = pending->target;
 					continue;
 				}
-				if (pc == context.process.return_gate() && outer > 0) {
+				if (context.process.callback_boundary(pc) && outer > 0) {
 					current = mine().active[--outer].origin;
 					level = mine().active[outer].depth;
 					continue;
 				}
 				// A search raised from a handler that an unwind is running continues in the frames of whoever called the unwind,
 				// then in the contexts of the dispatches that the unwind has already crossed.
-				if (pc == context.process.return_gate() && continuation_cursor < mine().continuation.size()) {
+				if (context.process.callback_boundary(pc) && continuation_cursor < mine().continuation.size()) {
 					level = mine().continuation_depths[continuation_cursor];
 					current = mine().continuation[continuation_cursor++];
 					continue;
 				}
 				if (trace)
-					std::fprintf(stderr, "seh frame: pc=%llx has no unwind data%s\n", (unsigned long long)pc, pc == context.process.return_gate() ? " (callback boundary)" : "");
+					std::fprintf(stderr, "seh frame: pc=%llx has no unwind data%s\n", (unsigned long long)pc, context.process.callback_boundary(pc) ? " (callback boundary)" : "");
 				// With no outer dispatch the boundary ends the search: no frames of the guest's caller are on this stack.
-				if (pc == context.process.return_gate() || !readable(pc))
+				if (context.process.callback_boundary(pc) || !readable(pc))
 					break;
 				unwinder.unwind_leaf(current);
 				continue;
@@ -179,8 +193,8 @@ public:
 			ContextBytes next = current;
 			const auto result = unwinder.unwind(1, pc, *function, next);
 			if (trace)
-				std::fprintf(stderr, "seh frame: pc=%llx function=%x..%x unwind=%x handler=%llx\n", (unsigned long long)pc, function->begin, function->end,
-					function->unwind, (unsigned long long)result.handler);
+				std::fprintf(stderr, "seh frame: pc=%llx function=%x..%x unwind=%x handler=%llx rsp=%llx establisher=%llx\n", (unsigned long long)pc, function->begin, function->end,
+					function->unwind, (unsigned long long)result.handler, (unsigned long long)context_rsp(current), (unsigned long long)result.establisher);
 			if (result.handler) {
 				context.process.write_memory(frame_context, next);
 				std::vector<uint8_t> descriptor(dispatcher_size);
@@ -465,6 +479,9 @@ public:
 	}
 
 	// Execution resumes at the callback nesting where the exception was raised; handler calls above it are abandoned.
+	// The upper halves of the YMM registers a context being restored brings, for the redirect that follows.
+	std::optional<std::array<uint8_t, x64_context::avx_size>> restored_avx;
+
 	[[noreturn]] void redirect_to(const ContextBytes &given, size_t depth, size_t mark = SIZE_MAX)
 	{
 		auto target = given;
@@ -478,6 +495,10 @@ public:
 		}
 		auto native = context.process.context();
 		apply_context(native, target);
+		if (restored_avx) {
+			set_native_avx(native, restored_avx->data());
+			restored_avx.reset();
+		}
 		context.process.redirect(native, depth);
 		if (const char *count = std::getenv("RAVEN_STEP_REDIRECT")) {
 			// Diagnosis aid: log the instructions executed right after execution is redirected.
@@ -591,7 +612,7 @@ public:
 		bool reached = false;
 		for (int frames = 0; frames < 1024 && !reached; ++frames) {
 			const uint64_t pc = context_rip(current);
-			if (pc == context.process.return_gate() && !mine().active.empty()) {
+			if (context.process.callback_boundary(pc) && !mine().active.empty()) {
 				// The host callback boundary stands in for the dispatcher's own frames: continue from where the exception was raised.
 				current = mine().active.back().origin;
 				depth = mine().active.back().depth;
@@ -605,15 +626,15 @@ public:
 			// With no dispatch left to cross, an unwind raised from inside another unwind continues through the contexts
 			// that the enclosing unwind recorded.
 			// Execution resumes no deeper than the callback nesting those contexts were left at.
-			if (pc == context.process.return_gate() && outer_cursor < previous_size) {
+			if (context.process.callback_boundary(pc) && outer_cursor < previous_size) {
 				depth = std::min(depth, mine().continuation_depths[outer_cursor]);
 				current = mine().continuation[outer_cursor++];
 				continue;
 			}
 			// Past the return gate of a callback that no dispatch made, the frames are those of the API call that made it; execution
 			// resumes at that nesting, abandoning the callback.
-			if (pc == context.process.return_gate() && depth > 0) {
-				current = context_from_process(context.process.callback_origin(--depth));
+			if (context.process.callback_boundary(pc) && depth > 0) {
+				current = callback_frames(context.process, --depth, current);
 				continue;
 			}
 			if (!pc)
@@ -623,6 +644,9 @@ public:
 				// Unwinding past a catch block's callback abandons that catch: its function's frame follows.
 				if (const auto *pending = consolidation_returning_to(pc, current)) {
 					current = pending->target;
+					// What that catch would have given back on returning goes back when this unwind's own catch ends.
+					resume_mark = std::min(resume_mark, pending->mark);
+					mine().unwinds.back().mark = resume_mark;
 					mine().consolidations.erase(mine().consolidations.begin() + (pending - mine().consolidations.data()), mine().consolidations.end());
 					continue;
 				}
@@ -840,20 +864,9 @@ void register_exception_api(ApiRegistry &registry, KernelContext &context, Nativ
 			context.process.abandon_call();
 			throw ProcessExit{0xc0000409U, rip, true};
 		}
-		uint32_t status = 0xc0000005U;
-		std::vector<uint64_t> parameters;
-		switch (fault.signal) {
-		case SIGSEGV: parameters = {0, fault.fault_address}; break;
-		case SIGBUS: status = 0xc0000006U; parameters = {0, fault.fault_address, 0xc0000006U}; break;
-		case SIGFPE:
-			status = fault.signal_code == FPE_INTDIV ? 0xc0000094U : fault.signal_code == FPE_INTOVF ? 0xc0000095U :
-				fault.signal_code == FPE_FLTDIV ? 0xc000008eU : fault.signal_code == FPE_FLTOVF ? 0xc0000091U : 0xc000008fU;
-			break;
-		case SIGILL: status = 0xc000001dU; break;
-		case SIGTRAP: status = 0x80000003U; break;
-		default: break;
-		}
-		auto record = exceptions->new_record(status, 0, rip, parameters);
+		const auto raised = processor_exception(context.process, fault, rip);
+		set_context_rip(origin, raised.address);
+		auto record = exceptions->new_record(raised.status, 0, raised.address, raised.parameters);
 		// As KiUserExceptionDispatcher finds them: the CONTEXT on a 16-byte boundary below the faulting stack pointer and the record above
 		// it, and the handlers' calls below both. The .NET runtime turns a fault in managed code into an exception from these.
 		const uint64_t frame = (context_rsp(origin) - 0x40 - x64_context::size - ((record_size + 15) & ~size_t(15))) & ~uint64_t(15);
@@ -1016,11 +1029,52 @@ void register_exception_api(ApiRegistry &registry, KernelContext &context, Nativ
 	});
 	// The context resumes at the callback nesting its stack belongs to: callbacks begun from deeper in the stack than its frame, such as the
 	// handler calls of a dispatch that a runtime leaves this way for a catch block, are abandoned.
+	// A runtime may also leave the handler calls of a dispatch by loading the continuation's registers itself, as the .NET runtime does
+	// after a catch block, so that no RtlRestoreContext tells of it. The guest's next API call then comes from a stack that the
+	// innermost callbacks were started below: they are over, their frames gone, and the call is made again at the nesting its stack
+	// belongs to. A stack pointer outside the stack the TEB describes, as on another fiber's stack, says nothing about the callbacks.
+	context.leave_abandoned_callbacks = [exceptions, &context] {
+		if (context.process.mode() != NativeMode::x64)
+			return;
+		// Asked at every call made inside a callback, so only what the call itself tells is looked at: its stack pointer and its thread.
+		const uint64_t stack = context.process.api_stack_pointer();
+		const auto bounds = context.process.read_memory(context.environment.teb() + 8, 16);
+		const uint64_t base = load64(bounds, 0), limit = load64(bounds, 8);
+		if (stack < limit || stack >= base)
+			return;
+		size_t depth = context.process.callback_depth();
+		while (depth > 0) {
+			const uint64_t origin = context.process.callback_stack(depth - 1);
+			if (origin < limit || origin > stack)
+				break;
+			--depth;
+		}
+		if (depth == context.process.callback_depth())
+			return;
+		if (std::getenv("RAVEN_TRACE_SEH"))
+			std::fprintf(stderr, "seh: callbacks %zu..%zu left by a jump to rsp=%llx\n", depth, context.process.callback_depth(),
+				(unsigned long long)stack);
+		// The trap stopped one byte past the API's entry: execution goes back there to make the call again.
+		auto target = context_from_process(context.process.context());
+		set_context_rip(target, context_rip(target) - 1);
+		exceptions->redirect_to(target, depth);
+	};
 	const auto restore = [exceptions, &context](ApiCall &call) {
 		const auto target = call.read(call[0], x64_context::size);
+		// A context with an extended area also brings back the upper halves of the YMM registers its mask names, or clears them.
+		if (const uint64_t area = context_extended_area(context.process, call[0])) {
+			exceptions->restored_avx.emplace();
+			if (call.load<uint64_t>(area) & x64_context::avx_mask) {
+				const auto halves = call.read(area + x64_context::extended_header, x64_context::avx_size);
+				std::memcpy(exceptions->restored_avx->data(), halves.data(), halves.size());
+			}
+		}
 		size_t depth = context.process.callback_depth();
 		while (depth > 0 && context.process.callback_origin(depth - 1).registers.rsp <= context_rsp(target))
 			--depth;
+		if (std::getenv("RAVEN_TRACE_SEH"))
+			std::fprintf(stderr, "seh restore: rip=%llx rsp=%llx depth %zu->%zu\n", (unsigned long long)context_rip(target), (unsigned long long)context_rsp(target),
+				context.process.callback_depth(), depth);
 		exceptions->redirect_to(target, depth);
 	};
 	exceptions->trap_gate = 0;

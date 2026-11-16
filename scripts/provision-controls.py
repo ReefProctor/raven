@@ -161,10 +161,10 @@ def main():
     run([triple + "-gcc", "-c", *shell_flags, shell_support / "fileinfo.c", "-o", shell_objects[15]])
     shell_defined = decorated(shell_objects)
     shell_names = ("GetRunningObjectTable", "CreateItemMoniker", "CoCreateInstance", "CoCreateInstanceEx", "CoGetClassObject", "CoGetTreatAsClass", "CoGetMalloc", "SHCreateItemFromParsingName", "SHGetPropertyStoreForWindow", "PropVariantClear", "SHAppBarMessage", "GetOpenFileNameW", "GetSaveFileNameW", "CommDlgExtendedError", "GetFileTitleW", "IUnknown_QueryService", "QISearch", "CLSIDFromProgID",
-                   "SHCreateStreamOnFileA", "SHCreateStreamOnFileW", "SHCreateStreamOnFileEx", "SHCreateMemStream", "PropVariantCopy", "CoGetContextToken", "CoGetObjectContext", "CoGetDefaultContext", "ExtractIconExW", "ExtractIconW", "UiaGetReservedNotSupportedValue", "UiaGetReservedMixedAttributeValue", "SHGetMalloc",
+                   "SHCreateStreamOnFileA", "SHCreateStreamOnFileW", "SHCreateStreamOnFileEx", "SHCreateMemStream", "PropVariantCopy", "CoGetContextToken", "CoGetObjectContext", "CoGetDefaultContext", "ExtractIconExW", "ExtractIconW", "SHDefExtractIconW", "UiaGetReservedNotSupportedValue", "UiaGetReservedMixedAttributeValue", "SHGetMalloc",
                    "OpenRegStream", "SHOpenRegStreamW", "SHOpenRegStreamA", "SHOpenRegStream2W", "SHOpenRegStream2A", "InitNetworkAddressControl",
                    "RoGetActivationFactory", "RoActivateInstance", "CoCreateFreeThreadedMarshaler",
-                   "SHGetDesktopFolder", "SHCreateItemFromIDList", "CreateFileMoniker", "SHLoadIndirectString", "SHGetPropertyStoreFromParsingName", "ILGetSize", "ILGetNext", "ILFindLastID", "ILClone", "ILCloneFirst", "ILCombine", "ILFree", "ILCreateFromPathW", "SHILCreateFromPath", "ILIsEqual",
+                   "SHGetDesktopFolder", "SHCreateItemFromIDList", "SHCreateShellItem", "CreateFileMoniker", "SHLoadIndirectString", "SHGetPropertyStoreFromParsingName", "ILGetSize", "ILGetNext", "ILFindLastID", "ILClone", "ILCloneFirst", "ILCombine", "ILFree", "ILCreateFromPathW", "SHILCreateFromPath", "SHParseDisplayName", "SHBindToParent", "SHGetDataFromIDListW", "ILIsEqual",
                    "CreateErrorInfo", "SetErrorInfo", "GetErrorInfo", "CoWaitForMultipleHandles", "OleGetClipboard",
                    "CoRegisterClassObject", "CoRevokeClassObject", "CoResumeClassObjects", "CoSuspendClassObjects", "CoAddRefServerProcess", "CoReleaseServerProcess",
                    "SHGetFileInfoW", "SHGetFileInfoA")
@@ -174,12 +174,12 @@ def main():
     # The host services Raven's components call: fonts measured and rasterized with FreeType, surfaces drawn with Skia, and the sandbox
     # calls of the control panel and the file picker.
     host_names = ["RavenFontClose", "RavenFontGlyphs", "RavenFontInfo", "RavenFontMetrics", "RavenFontName", "RavenFontOpen", "RavenFontOutline",
-                  "RavenFontRender", "RavenFontScan", "RavenFontTable", "RavenTrace", "RavenCanvasBatch", "RavenCanvasCreate", "RavenCanvasDestroy", "RavenCanvasDraw",
+                  "RavenFontRender", "RavenFontScan", "RavenFontTable", "RavenTrace", "RavenCanvasBatch", "RavenCanvasBounds", "RavenCanvasChanged", "RavenCanvasCreate", "RavenCanvasDestroy", "RavenCanvasDraw",
                   "RavenCanvasPixels", "RavenCanvasSize", "RavenPathCombine", "RavenPathWiden",
                   "RavenGrantPath", "RavenSandboxRead", "RavenSandboxWrite", "RavenSandboxLog", "RavenSnapshotList", "RavenSnapshotTake", "RavenSnapshotRestore", "RavenSnapshotDelete", "RavenHostOpen", "RavenHostApps", "RavenAppList", "RavenAppDiscard"]
     # A 32-bit program calls them as stdcall functions, named by the bytes of their arguments, which the import names leave out.
     host_words = {"RavenFontClose": 1, "RavenFontGlyphs": 4, "RavenFontInfo": 2, "RavenFontMetrics": 3, "RavenFontName": 4, "RavenFontOpen": 3,
-                  "RavenFontOutline": 4, "RavenFontRender": 10, "RavenFontScan": 2, "RavenFontTable": 5, "RavenTrace": 1, "RavenCanvasBatch": 2,
+                  "RavenFontOutline": 4, "RavenFontRender": 10, "RavenFontScan": 2, "RavenFontTable": 5, "RavenTrace": 1, "RavenCanvasBatch": 2, "RavenCanvasBounds": 2, "RavenCanvasChanged": 3,
                   "RavenCanvasCreate": 2, "RavenCanvasDestroy": 1, "RavenCanvasDraw": 4, "RavenCanvasPixels": 8, "RavenCanvasSize": 2,
                   "RavenPathCombine": 8, "RavenPathWiden": 7, "RavenGrantPath": 2, "RavenSandboxRead": 2, "RavenSandboxWrite": 1, "RavenSandboxLog": 2,
                   "RavenSnapshotList": 2, "RavenSnapshotTake": 1, "RavenSnapshotRestore": 1, "RavenSnapshotDelete": 1, "RavenHostOpen": 1, "RavenHostApps": 2, "RavenAppList": 2, "RavenAppDiscard": 1}
@@ -232,11 +232,12 @@ def main():
         # The Direct2D component: Raven code on the public headers; surfaces live with the host and are drawn with Skia through ravenhost.dll,
         # text comes from the DirectWrite component and pictures from the imaging component.
         d2d1_support = repo / "native/guest/raven-d2d1"
-        d2d1_objects = [objects / "d2d1.o", objects / "d2d1_crt.o"]
+        d2d1_objects = [objects / "d2d1.o", objects / "d2d1_shader_run.o", objects / "d2d1_crt.o"]
         d2d1_flags = ["-O2", "-Wall", "-Wno-unused-function", "-Wno-unused-variable", "-ffreestanding", "-fno-builtin", "-fno-math-errno",
                       f"-ffile-prefix-map={repo}=raven"]
         run([triple + "-gcc", "-c", *d2d1_flags, "-I" + str(d2d1_support), d2d1_support / "d2d1.c", "-o", d2d1_objects[0]])
-        run([triple + "-gcc", "-c", *d2d1_flags, repo / "native/guest/raven-dwrite/crt.c", "-o", d2d1_objects[1]])
+        run([triple + "-gcc", "-c", *d2d1_flags, d2d1_support / "shader_run.c", "-o", d2d1_objects[1]])
+        run([triple + "-gcc", "-c", *d2d1_flags, repo / "native/guest/raven-dwrite/crt.c", "-o", d2d1_objects[2]])
         # Office binds D2D1CreateFactory by number, as ordinal 1 of the system library.
         (output / "raven-d2d1.def").write_text("NAME raven-d2d1.dll\nEXPORTS\nD2D1CreateFactory @1\n" + "".join(name + "\n" for name in (
             "D2D1ComputeMaximumScaleFactor", "D2D1ConvertColorSpace", "D2D1CreateDevice", "D2D1CreateDeviceContext",

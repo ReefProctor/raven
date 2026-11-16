@@ -153,9 +153,8 @@ bool NativeWindows::show_window(uint64_t handle, uint32_t command)
 			if (!is_min)
 				window->restore = window->outer;
 			window->style = (window->style & ~ws_minimize) | ws_maximize;
-			const auto frame = adjust_window_rect(objects.nonclient_metrics(), {0, 0, 0, 0}, window->style & ~ws_visible, window->menu != 0, window->ex_style);
-			(void)frame;
-			reshape(handle, {0, 0, screen.screen_x, screen.screen_y});
+			// The window hears of its new place as of any other: WM_WINDOWPOSCHANGED, which a program may lay its content out from.
+			place_window(handle, {0, 0, screen.screen_x, screen.screen_y}, 0, 0x14);
 		} else if (minimize && !is_min) {
 			if (!is_max)
 				window->restore = window->outer;
@@ -164,10 +163,28 @@ bool NativeWindows::show_window(uint64_t handle, uint32_t command)
 			window->style &= ~(ws_maximize | ws_minimize);
 			const auto target = window->restore.right > window->restore.left ? window->restore : window->outer;
 			if (is_max)
-				reshape(handle, target);
+				place_window(handle, target, 0, 0x14);
 		}
 		window = objects.window(handle);
 	}
+	if (window->parent && maximize && !(window->style & ws_maximize)) {
+		// A maximized child covers its parent's client area with its own. Its caption and border lie outside, where the parent clips
+		// them, as a document in an MDI client.
+		const auto *parent = std::as_const(objects).window(window->parent);
+		if (!parent)
+			throw uint32_t(1400);
+		window->restore = window->outer;
+		window->style |= ws_maximize;
+		place_window(handle, adjust_window_rect(objects.nonclient_metrics(), {parent->x, parent->y, parent->x + parent->width, parent->y + parent->height},
+			window->style & ~ws_visible, false, window->ex_style), 0, 0x14);
+		window = objects.window(handle);
+	} else if (window->parent && (command == 9 || command == 1 || command == 10) && (window->style & ws_maximize)) {
+		window->style &= ~ws_maximize;
+		place_window(handle, window->restore, 0, 0x14);
+		window = objects.window(handle);
+	}
+	if (!window)
+		throw uint32_t(1400);
 	const bool show = !hide && !(window->style & ws_minimize && !window->parent);
 	if (show && (!window->parent || objects.window_visible(window->parent)))
 		present(handle);
@@ -281,15 +298,14 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 			objects.restack(handle, true);
 		else {
 			objects.restack(handle, true);
-			// Insert directly above the named sibling: every sibling above it climbs over this window.
+			// The window goes directly below the named sibling, which precedes it: that sibling and every one above it climb over it.
 			const auto *sibling = std::as_const(objects).window(after);
 			auto *self = objects.window(handle);
 			if (sibling && self) {
 				self->order = sibling->order;
 				for (const auto other : objects.child_windows(window->parent))
-					if (other != handle && std::as_const(objects).window(other)->order >= sibling->order && other != after)
+					if (other != handle && std::as_const(objects).window(other)->order >= self->order)
 						++objects.window(other)->order;
-				++self->order;
 			}
 		}
 		window = objects.window(handle);
@@ -328,6 +344,11 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 	} placing_guard{placing, handle, placing.insert(handle).second};
 	if (shifted && !resized && !window->parent) {
 		shift_window(handle, target.left - old.left, target.top - old.top);
+		// A window shown on its owner's lies there by where it is from the owner: moved, it is shown again in its new place.
+		if (was_visible) {
+			dirty_roots.insert(handle);
+			dirty_whole.insert(handle);
+		}
 	} else if (shifted || resized) {
 		const auto old_client_x = window->x, old_client_y = window->y;
 		if (window->parent && was_visible)
@@ -365,6 +386,16 @@ void NativeWindows::place_window(uint64_t handle, DesktopRect outer, uint64_t in
 	window = objects.window(handle);
 	if (!window)
 		return;
+	// The windows shown on this one's, the ones it owns, lie there by where they are from it: they are shown again where that puts
+	// them now.
+	if (!window->parent && (shifted || resized))
+		for (const auto other : objects.window_handles()) {
+			const auto *owned = std::as_const(objects).window(other);
+			if (owned && other != handle && owned->visible && host_owner(*owned) == handle && shown_on_owner(*owned)) {
+				dirty_roots.insert(other);
+				dirty_whole.insert(other);
+			}
+		}
 	// SWP_FRAMECHANGED asks the window for its client area again, as a program that draws its own frame does after it changes.
 	if ((effective & 0x20) && !(shifted || resized)) {
 		recalculate_client(handle);
@@ -522,7 +553,8 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 		switch (call.u32(1)) {
 		case 0: call.ret(siblings.empty() ? 0 : siblings.back()); break;
 		case 1: call.ret(siblings.empty() ? 0 : siblings.front()); break;
-		case 2: call.ret(position == siblings.begin() ? 0 : *(position - 1)); break;
+		// A window still in WM_NCCREATE is not among its siblings and has no neighbors.
+		case 2: call.ret(position == siblings.end() || position == siblings.begin() ? 0 : *(position - 1)); break;
 		case 3: call.ret(position == siblings.end() || position + 1 == siblings.end() ? 0 : *(position + 1)); break;
 		case 4: call.ret(window->owner); break;
 		case 5: {
@@ -997,7 +1029,7 @@ void NativeWindows::register_manager_api(ApiRegistry &registry)
 				for (const auto root : top_level_windows())
 					apply(apply, root, rect, true);
 			if (flags & 0x100) {
-				if (std::as_const(objects).window(handle) && !std::as_const(objects).window(handle)->update.empty())
+				if (std::as_const(objects).window(handle) && std::as_const(objects).window(handle)->needs_paint())
 					send(handle, 0x0f, 0, 0);
 			}
 			call.ret(1);

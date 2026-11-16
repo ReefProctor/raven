@@ -67,7 +67,7 @@ static raven::ModuleBytes map_module(const std::filesystem::path &path)
 {
 	auto bytes = raven::ModuleBytes::map(path);
 	if (!bytes)
-		throw std::runtime_error("cannot map PE file");
+		throw std::runtime_error("cannot map PE file: " + path.string());
 	if (std::span<const uint8_t>(*bytes).size() > 0xffffffffULL)
 		throw std::runtime_error("PE file exceeds inspection size limit");
 	return std::move(*bytes);
@@ -819,6 +819,7 @@ int main(int argc, char **argv)
 					if (const auto multimedia = component_directory / "raven-winmm.dll"; !modules.all().contains("raven-winmm.dll") &&
 						std::filesystem::exists(multimedia))
 						modules.add("raven-winmm.dll", read_file(multimedia.c_str()));
+					// The compression manager answers for msacm32.dll in every program, as libraries load it later as often as programs import it.
 					if (const auto acm = component_directory / "raven-msacm32.dll"; !modules.all().contains("raven-msacm32.dll") &&
 						std::filesystem::exists(acm))
 						modules.add("raven-msacm32.dll", read_file(acm.c_str()));
